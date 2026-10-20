@@ -255,9 +255,10 @@ or tested.
 
 This is an early release (0.2). Please read these before relying on it:
 
-- **Package install checked only lightly.** I verified that `pi install` accepts the
-  manifest and lists it, using an isolated agent directory. I have not yet checked a
-  full session that loads the extension from a package install.
+- **Package install checked once.** One real Pi session loaded `v0.2.0` through
+  `pi -e git:github.com/codecapitano/pi-subagent@v0.2.0`. The model read the agent
+  list from the tool description, made a parallel call with two tasks, and the result
+  carried the clamp notice. This was a single short run, not a long-term test.
 - **Agents are not bundled automatically.** Copy the starter agents yourself (see
   [Define agents](#define-agents)). The agent list in the tool description is read at
   load, so run `/reload` after changing agents.
