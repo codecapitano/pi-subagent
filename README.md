@@ -44,9 +44,28 @@ processes and make no model calls.
 
 ## Install
 
-You need an existing Pi installation. The extension is four files that Pi loads from a
-folder, so the simplest install is a plain copy that you can read line by line. Run
-these commands from this directory:
+You need an existing Pi installation. Pick one method, not both: loading the
+extension twice can register the tool twice.
+
+### Pi package (recommended)
+
+```sh
+pi install git:github.com/codecapitano/pi-subagent@v0.1.0
+```
+
+The `@v0.1.0` tag pins the version. Update by installing a newer tag. Run `/reload`
+while Pi is idle, or restart Pi. This loads `index.ts` straight from the package;
+it does not copy anything into `~/.pi/agent/extensions/`. Remove it with
+`pi remove git:github.com/codecapitano/pi-subagent`. Packages run code, so read the
+source first. It is four files, and the starter agents are plain Markdown.
+
+The package does not install agents. Copy the starters yourself (see
+[Define agents](#define-agents)).
+
+### Manual copy
+
+The extension is four files that Pi loads from a folder, so a plain copy also works
+and can be read line by line. Run these commands from this directory:
 
 ```sh
 mkdir -p ~/.pi/agent/extensions/subagent
@@ -54,10 +73,9 @@ cp index.ts agents.ts lifecycle.mjs output.mjs ~/.pi/agent/extensions/subagent/
 ```
 
 Then run `/reload` while Pi is idle, or restart Pi. The loaded extension does not
-change when files on disk change. Do not also load this repository directory as an
-extension, or the tool can register twice.
+change when files on disk change.
 
-### Optional: installer script
+### Optional: installer script (manual copy)
 
 `node scripts/install.mjs` does the same copy with a few safety checks. It has no
 dependencies and makes no network calls. In order, it:
@@ -229,8 +247,9 @@ or tested.
 
 This is an early release (0.1). Please read these before relying on it:
 
-- **Not yet a Pi package.** Install is a file copy. A `pi install git:...` manifest
-  is planned but not done or tested.
+- **Package install checked only lightly.** I verified that `pi install` accepts the
+  manifest and lists it, using an isolated agent directory. I have not yet checked a
+  full session that loads the extension from a package install.
 - **Agents are not bundled automatically.** Copy the starter agents yourself (see
   [Define agents](#define-agents)). The agent list in the tool description is read at
   load, so run `/reload` after changing agents.
