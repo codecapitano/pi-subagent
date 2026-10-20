@@ -50,10 +50,10 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.1.0
+pi install git:github.com/codecapitano/pi-subagent@v0.2.0
 ```
 
-The `@v0.1.0` tag pins the version. Update by installing a newer tag. Run `/reload`
+The `@v0.2.0` tag pins the version. Update by installing a newer tag. Run `/reload`
 while Pi is idle, or restart Pi. This loads `index.ts` straight from the package;
 it does not copy anything into `~/.pi/agent/extensions/`. Remove it with
 `pi remove git:github.com/codecapitano/pi-subagent`. Packages run code, so read the
@@ -253,7 +253,7 @@ or tested.
 
 ## Status and known limitations
 
-This is an early release (0.1). Please read these before relying on it:
+This is an early release (0.2). Please read these before relying on it:
 
 - **Package install checked only lightly.** I verified that `pi install` accepts the
   manifest and lists it, using an isolated agent directory. I have not yet checked a
