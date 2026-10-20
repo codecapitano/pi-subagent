@@ -164,7 +164,7 @@ export function formatAgentList(agents: AgentConfig[], maxItems: number): { text
 export function describeAgents(agents: AgentConfig[], maxItems = 20, maxDescription = 120): string {
 	if (agents.length === 0) return "No user-level agents are defined yet.";
 	const clip = (text: string) => {
-		const oneLine = text.replace(/\s+/g, " ").trim();
+		const oneLine = text.replace(/\s+/g, " ").trim().replace(/[.;]+$/, "");
 		return oneLine.length > maxDescription ? `${oneLine.slice(0, maxDescription - 3)}...` : oneLine;
 	};
 	const lines = agents.slice(0, maxItems).map((a) => `${a.name}: ${clip(a.description)}`);
