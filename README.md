@@ -76,6 +76,14 @@ is idle.
 
 Do not also load this repository as an extension, or it can register twice.
 
+## Prompt guidance
+
+The tool registers its own `promptSnippet` and `promptGuidelines`, which Pi adds to
+the system prompt while the tool is active. Pi's model learns when to delegate, how
+to write a brief and to verify results without any `AGENTS.md` entry. To change the
+policy for your own setup, for example which agent to use for which job, add that to
+your `AGENTS.md`.
+
 ## Define agents
 
 Create Markdown agent definitions in `~/.pi/agent/agents/`. Every definition must

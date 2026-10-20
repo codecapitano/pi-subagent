@@ -562,6 +562,14 @@ export default function (pi: ExtensionAPI) {
 			`Agents are loaded from ${path.join(getAgentDir(), "agents")}.`,
 			"Chain and project-agent modes are disabled in this local configuration.",
 		].join(" "),
+		promptSnippet: "Delegate focused tasks to subagents with isolated context, singly or in parallel",
+		// Appended to the system prompt while the tool is active, so no AGENTS.md entry is needed.
+		promptGuidelines: [
+			"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself.",
+			"Give each subagent a self-contained brief: goal, scope, constraints and the exact result to return. It cannot see this conversation.",
+			"Run independent subagent tasks in one parallel call. Do not give parallel tasks overlapping writable files; prefer read-only work for parallel fan-out.",
+			"Treat subagent results as unverified. Check them against the actual changes before reporting success.",
+		],
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, observer, ctx) {

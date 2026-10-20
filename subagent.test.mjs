@@ -683,6 +683,14 @@ test("loader registers the subagent tool and a session_shutdown handler", async 
 	});
 });
 
+test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is required", async () => {
+	await withExtension(undefined, async ({ tool }) => {
+		assert.ok(tool.promptSnippet);
+		assert.ok(tool.promptGuidelines.length > 0);
+		assert.ok(tool.promptGuidelines.every((g) => typeof g === "string" && g.length > 0));
+	});
+});
+
 test("project scope, chain mode and oversized batches are rejected without spawning", async () => {
 	await withExtension(undefined, async ({ call, events }) => {
 		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "project" })), /Project-local subagents are disabled/);
