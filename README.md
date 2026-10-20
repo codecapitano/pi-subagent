@@ -78,7 +78,11 @@ Do not also load this repository as an extension, or it can register twice.
 
 ## Prompt guidance
 
-The tool registers its own `promptSnippet` and `promptGuidelines`, which Pi adds to
+The tool lists your available agents (name and description) in its own description,
+so the model knows which roles exist without an `AGENTS.md` roster. The list is read
+when the extension loads; run `/reload` after adding or renaming an agent.
+
+The tool also registers its own `promptSnippet` and `promptGuidelines`, which Pi adds to
 the system prompt while the tool is active. Pi's model learns when to delegate, how
 to write a brief and to verify results without any `AGENTS.md` entry. To change the
 policy for your own setup, for example which agent to use for which job, add that to

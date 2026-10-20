@@ -159,3 +159,15 @@ export function formatAgentList(agents: AgentConfig[], maxItems: number): { text
 		remaining,
 	};
 }
+
+/** One line per agent for the tool description, bounded so a large directory cannot bloat the prompt. */
+export function describeAgents(agents: AgentConfig[], maxItems = 20, maxDescription = 120): string {
+	if (agents.length === 0) return "No user-level agents are defined yet.";
+	const clip = (text: string) => {
+		const oneLine = text.replace(/\s+/g, " ").trim();
+		return oneLine.length > maxDescription ? `${oneLine.slice(0, maxDescription - 3)}...` : oneLine;
+	};
+	const lines = agents.slice(0, maxItems).map((a) => `${a.name}: ${clip(a.description)}`);
+	const more = agents.length - lines.length;
+	return `Available agents: ${lines.join("; ")}${more > 0 ? `; and ${more} more` : ""}.`;
+}

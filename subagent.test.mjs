@@ -691,6 +691,13 @@ test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is 
 	});
 });
 
+test("the tool description lists the available agents so no AGENTS.md roster is needed", async () => {
+	await withExtension(undefined, async ({ tool }) => {
+		assert.match(tool.description, /Available agents: .*worker: test worker/);
+		assert.match(tool.description, /Available agents: .*reviewer: test reviewer/);
+	});
+});
+
 test("project scope, chain mode and oversized batches are rejected without spawning", async () => {
 	await withExtension(undefined, async ({ call, events }) => {
 		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "project" })), /Project-local subagents are disabled/);

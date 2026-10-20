@@ -29,7 +29,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentScope, describeAgents, discoverAgents } from "./agents.ts";
 import { createChildRunner, parseConcurrency } from "./lifecycle.mjs";
 import { createHistory, createLineReader, createStderrBuffer, createUsageTotals, joinTextParts, truncateUtf8, BATCH_OUTPUT_BYTES, FINAL_BYTES } from "./output.mjs";
 
@@ -551,6 +551,15 @@ export default function (pi: ExtensionAPI) {
 		await runner.shutdown();
 	});
 
+	// The model can only name agents it knows about. List them here so no AGENTS.md roster is
+	// needed. Read once at load; add or rename agents, then /reload.
+	let rosterText = "No user-level agents are defined yet.";
+	try {
+		rosterText = describeAgents(discoverAgents(process.cwd(), "user").agents);
+	} catch {
+		/* a broken agents directory must not prevent the tool from loading */
+	}
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -560,7 +569,8 @@ export default function (pi: ExtensionAPI) {
 			`At most ${limits.base} subagent processes run at once per Pi runtime (PI_SUBAGENT_MAX_CONCURRENCY, 1-16); extra tasks wait in FIFO order.`,
 			`In parallel mode, maxConcurrency may raise that to at most ${limits.ceiling} for the call; use it only for independent read-only work.`,
 			`Agents are loaded from ${path.join(getAgentDir(), "agents")}.`,
-			"Chain and project-agent modes are disabled in this local configuration.",
+			rosterText,
+			"Chain and project-agent modes are disabled.",
 		].join(" "),
 		promptSnippet: "Delegate focused tasks to subagents with isolated context, singly or in parallel",
 		// Appended to the system prompt while the tool is active, so no AGENTS.md entry is needed.
