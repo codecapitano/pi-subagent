@@ -1,20 +1,46 @@
 # pi-subagent
 
 Parallel subagents for the [Pi coding agent](https://github.com/earendil-works/pi).
-Each task runs in a separate Pi process with its own model context. A shared
-limiter keeps the number of active children bounded, and the agent can raise that
-limit per call, up to a ceiling you control.
+Pi can hand focused tasks to helper agents. Each helper runs in its own process
+with a fresh context and returns a short result.
+
+## Why use subagents
+
+- **A clean main context.** Searching, reading many files and running noisy
+  checks happen in the helper. Your main session receives the conclusion, not the
+  transcript, so it stays focused for longer.
+- **Speed for independent work.** Tasks that do not depend on each other run at
+  the same time. Reviewing five modules takes about as long as the slowest one.
+- **Independent review and the right model per role.** A reviewer that has not
+  seen your reasoning can catch what the author missed. Each agent definition sets
+  its own model and tool allowlist, so cheap models can do mechanical work and
+  strong models can review.
+
+## When it is worth it
+
+Subagents use more tokens in total, and the parent waits until a batch finishes.
+This extension has no background jobs. Use them when work splits into independent
+parts, or when the output is much larger than its conclusion.
+
+A helper only knows what its brief says, and its summary can lose detail, so the
+parent should check the results. Parallel helpers share one filesystem. Prefer
+read-only work such as exploration and review, or give each writer separate files.
+Tool allowlists limit what an agent can call. They are not a sandbox.
+
+## What this extension adds
+
+- Single calls and parallel batches of up to 32 tasks.
+- A shared limiter keeps active helpers bounded (default 6). Extra tasks wait in
+  order.
+- The agent can raise the limit for one call with `maxConcurrency`, up to a
+  ceiling you set (default 8). It can never go above it.
+- Bounded output and per-task results, so a large batch cannot flood the parent's
+  context. One failed task does not lose the others.
+- Clean cancellation and shutdown. Cancelled tasks never start, and running
+  helpers are stopped.
 
 Developed and tested against Pi 1.2 and 1.3. Offline tests use fake child
 processes and make no model calls.
-
-## Features
-
-- Single calls and parallel batches of up to 32 tasks.
-- Shared FIFO limiter across overlapping calls (default 6 active children).
-- Per-call `maxConcurrency` raise, clamped to a configurable ceiling (default 8).
-- Bounded output, usage totals, UTF-8-safe truncation and per-task results.
-- Clean cancellation and shutdown (SIGTERM, then SIGKILL after five seconds).
 
 ## Install
 
