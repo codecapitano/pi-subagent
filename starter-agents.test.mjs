@@ -39,7 +39,7 @@ const FORBIDDEN = [
 	/openai-codex|luna|\bsol:/i,
 	/[A-Za-z0-9._%+-]+@(?!users\.noreply\.github\.com)[A-Za-z0-9.-]+\.[a-z]{2,}/i,
 	/gh[pousr]_[A-Za-z0-9]{20,}/,
-	/\bmcp__/,
+	/\bmcp__(?!chrome_devtools__|figma__)/,
 ];
 function publishedFiles(dir) {
 	return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -59,4 +59,17 @@ test("no published file contains machine-specific or private details", () => {
 		}
 	}
 	assert.deepEqual(hits, []);
+});
+
+test("optional agents are valid and do not pin a model", () => {
+	const dir = path.join(agentsDir, "optional");
+	const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
+	assert.deepEqual(files, ["design-reviewer.md"]);
+	for (const file of files) {
+		const match = /^---\n([\s\S]*?)\n---\n([\s\S]+)$/.exec(fs.readFileSync(path.join(dir, file), "utf8"));
+		assert.ok(match, `${file} frontmatter`);
+		assert.equal(/^name: (.+)$/m.exec(match[1])?.[1], file.replace(/\.md$/, ""));
+		assert.match(match[1], /^tools: \[[^\]]+\]$/m);
+		assert.doesNotMatch(match[1], /^model:/m);
+	}
 });

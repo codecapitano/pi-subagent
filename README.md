@@ -121,6 +121,14 @@ them without overwriting your own files:
 mkdir -p ~/.pi/agent/agents && cp -n agents/*.md ~/.pi/agent/agents/
 ```
 
+An optional `design-reviewer` (UI fidelity and accessibility review) is in
+[`agents/optional/`](agents/optional/). It expects `codemode` and MCP servers named
+`chrome_devtools` and `figma`, and its prompt tells it to report any tool it cannot
+reach instead of claiming checks passed. I have not verified how Pi treats an
+allowlist entry for a server that is not configured, so try it before relying on it.
+
+For routing rules of your own, see [`docs/agents-md-snippet.md`](docs/agents-md-snippet.md).
+
 The starters do not pin a model, so each helper uses the parent's model. Model IDs
 depend on your providers. To route a role to a cheaper or stronger model, add a
 line such as `model: <provider>/<model>:low` to its frontmatter. `transformer` has
