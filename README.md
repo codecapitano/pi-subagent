@@ -264,7 +264,7 @@ This is an early release (0.1). Please read these before relying on it:
 - **No background jobs.** The parent waits for the whole batch, and there is no
   automatic task timeout. A hung child holds a slot until cancelled.
 - **Tests need a Pi installation.** The loader tests read Pi from
-  `~/.pi/agent/install`, or from `PI_CORE_DIR`. There is no CI yet.
+  `~/.pi/agent/install`, or from `PI_CORE_DIR`. CI installs Pi 1.3.0 from npm.
 - **Legacy code.** Chain mode and project-local agents are rejected but still
   present in the source, for compatibility with stored calls.
 - **Unverified in practice.** The tests use fake child processes. Real provider rate
