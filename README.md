@@ -44,37 +44,36 @@ processes and make no model calls.
 
 ## Install
 
-Requires Node.js and an existing Pi installation. From this directory, while no
-subagents are running:
+You need an existing Pi installation. From this directory: the extension is four files that Pi loads
+from a folder, so the simplest install is a plain copy that you can read line by line:
 
 ```sh
-node scripts/install.mjs
+mkdir -p ~/.pi/agent/extensions/subagent
+cp index.ts agents.ts lifecycle.mjs output.mjs ~/.pi/agent/extensions/subagent/
 ```
 
-The installer copies the runtime, documentation and offline tests to
-`~/.pi/agent/extensions/subagent/` as regular files. It backs up existing owned
-files under `~/.pi/agent/backups/`, preserves unrelated files, and refuses symlink
-destinations. Agent definitions in `~/.pi/agent/agents/` are not modified.
-File replacements are individually atomic, not a transaction across all files. If
-installation fails partway through, restore the reported backup or rerun the
-installer before reloading Pi.
+Then run `/reload` while Pi is idle, or restart Pi. The loaded extension does not
+change when files on disk change. Do not also load this repository directory as an
+extension, or the tool can register twice.
 
-Run `/reload` while Pi is idle, or restart Pi. The loaded extension does not
-change when files on disk change.
+### Optional: installer script
 
-To install into another directory:
+`node scripts/install.mjs` does the same copy with a few safety checks. It has no
+dependencies and makes no network calls. In order, it:
 
-```sh
-node scripts/install.mjs /path/to/extensions/subagent
-```
+1. Refuses to continue if the destination or any file it would replace is a symlink,
+   or if the destination is this source directory.
+2. Copies the files into a hidden staging folder inside the destination.
+3. Copies any existing versions of those files to a new folder under
+   `~/.pi/agent/backups/` and prints its path.
+4. Renames the staged files into place. Each file swap is atomic, but the whole
+   install is not one transaction. If it stops partway, restore the printed backup
+   or run it again.
 
-Set `PI_SUBAGENT_BACKUP_DIR` to override the backup directory. Empty overrides
-and known extension discovery roots are rejected. Keep backups outside any other
-extension directory. Interrupted installations can leave hidden staging folders
-inside the destination; they are not auto-discovered and can be removed while Pi
-is idle.
-
-Do not also load this repository as an extension, or it can register twice.
+It installs the four runtime files plus `README.md`, `LICENSE` and the offline tests.
+It never touches `~/.pi/agent/agents/`, and it leaves other files in the destination
+alone. To install somewhere else, pass the folder as an argument. Set
+`PI_SUBAGENT_BACKUP_DIR` to move the backups.
 
 ## Prompt guidance
 
@@ -224,6 +223,26 @@ Loader tests resolve the current managed Pi installation. For another installati
 set `PI_CORE_DIR` to its `@earendil-works/pi-coding-agent` package directory.
 SIGKILL escalation uses process/timer fakes; descendant cleanup is not guaranteed
 or tested.
+
+## Status and known limitations
+
+This is an early release (0.1). Please read these before relying on it:
+
+- **Not yet a Pi package.** Install is a file copy. A `pi install git:...` manifest
+  is planned but not done or tested.
+- **Agents are not bundled automatically.** Copy the starter agents yourself (see
+  [Define agents](#define-agents)). The agent list in the tool description is read at
+  load, so run `/reload` after changing agents.
+- **Silent clamping.** If a call asks for `maxConcurrency` above your ceiling, it is
+  clamped without telling the model.
+- **No background jobs.** The parent waits for the whole batch, and there is no
+  automatic task timeout. A hung child holds a slot until cancelled.
+- **Tests need a Pi installation.** The loader tests read Pi from
+  `~/.pi/agent/install`, or from `PI_CORE_DIR`. There is no CI yet.
+- **Legacy code.** Chain mode and project-local agents are rejected but still
+  present in the source, for compatibility with stored calls.
+- **Unverified in practice.** The tests use fake child processes. Real provider rate
+  limits, throughput and how models use `maxConcurrency` have not been measured.
 
 ## Credits and license
 
