@@ -761,6 +761,17 @@ for (const [requested, expected] of [[8, 8], [12, 8]]) {
 	});
 }
 
+test("the result says when maxConcurrency was clamped or could not raise the limit", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		const clamped = await call({ maxConcurrency: 12, tasks: [P(1), P(2)] });
+		assert.match(text(clamped), /maxConcurrency 12 was clamped to the ceiling of 8/);
+		const noop = await call({ maxConcurrency: 4, tasks: [P(1), P(2)] });
+		assert.match(text(noop), /maxConcurrency 4 did not raise the limit/);
+		const honored = await call({ maxConcurrency: 8, tasks: [P(1), P(2)] });
+		assert.doesNotMatch(text(honored), /Note: maxConcurrency/);
+	});
+});
+
 test("maxConcurrency is clamped to a configured ceiling and cannot lower the base", async () => {
 	await withExtension("2", async ({ call, events }) => {
 		await call({ maxConcurrency: 1, tasks: [1, 2, 3, 4].map((n) => P(n, "sleep:150")) });

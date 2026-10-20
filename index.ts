@@ -752,6 +752,16 @@ export default function (pi: ExtensionAPI) {
 				// The shared limiter bounds active children; every task keeps its own result.
 				// A raise lasts only for this call so it cannot leak into later calls.
 				const lowerLimit = params.maxConcurrency ? runner.raise(params.maxConcurrency) : undefined;
+				// Say so when the request could not be honored, so the model does not assume more parallelism.
+				const requested = params.maxConcurrency;
+				const limitNote =
+					requested === undefined
+						? ""
+						: requested > limits.ceiling
+							? `Note: maxConcurrency ${requested} was clamped to the ceiling of ${limits.ceiling}.\n\n`
+							: requested <= limits.base
+								? `Note: maxConcurrency ${requested} did not raise the limit; it only raises above ${limits.base}.\n\n`
+								: "";
 				let results: SingleResult[];
 				try {
 				results = await Promise.all(
@@ -804,7 +814,7 @@ export default function (pi: ExtensionAPI) {
 								: "completed";
 					return `### [${truncateUtf8(r.agent, 128, "...")}] ${status}\n\n`;
 				});
-				const prefix = `Parallel: ${successCount}/${results.length} succeeded\n\n`;
+				const prefix = `${limitNote}Parallel: ${successCount}/${results.length} succeeded\n\n`;
 				const separator = "\n\n---\n\n";
 				const overhead = Buffer.byteLength(prefix + headers.join(separator));
 				const outputs = results.map(getResultOutput);

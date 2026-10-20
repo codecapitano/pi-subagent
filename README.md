@@ -140,7 +140,7 @@ below the base limit, or any invalid value, disables spawning and reports an
 error. Both are read once when the extension loads.
 
 In parallel mode the agent can pass `maxConcurrency` to raise the active limit for
-that call, clamped to the ceiling. It only raises: a lower value changes nothing,
+that call, clamped to the ceiling (the result says so). It only raises: a lower value changes nothing,
 and the raise ends when the call ends. Running children are never stopped when a
 raise ends; queued tasks wait until active children drop below the base limit.
 Overlapping calls use the highest raise that is still active.
@@ -234,8 +234,6 @@ This is an early release (0.1). Please read these before relying on it:
 - **Agents are not bundled automatically.** Copy the starter agents yourself (see
   [Define agents](#define-agents)). The agent list in the tool description is read at
   load, so run `/reload` after changing agents.
-- **Silent clamping.** If a call asks for `maxConcurrency` above your ceiling, it is
-  clamped without telling the model.
 - **No background jobs.** The parent waits for the whole batch, and there is no
   automatic task timeout. A hung child holds a slot until cancelled.
 - **Tests need a Pi installation.** The loader tests read Pi from
