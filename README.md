@@ -44,8 +44,9 @@ processes and make no model calls.
 
 ## Install
 
-You need an existing Pi installation. From this directory: the extension is four files that Pi loads
-from a folder, so the simplest install is a plain copy that you can read line by line:
+You need an existing Pi installation. The extension is four files that Pi loads from a
+folder, so the simplest install is a plain copy that you can read line by line. Run
+these commands from this directory:
 
 ```sh
 mkdir -p ~/.pi/agent/extensions/subagent
