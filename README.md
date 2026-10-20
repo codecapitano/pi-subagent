@@ -86,9 +86,23 @@ your `AGENTS.md`.
 
 ## Define agents
 
-Create Markdown agent definitions in `~/.pi/agent/agents/`. Every definition must
-declare a non-empty tool allowlist. Only user-level definitions are enabled;
-chain mode and project-local agents are disabled.
+Agents are Markdown files in `~/.pi/agent/agents/`. Every definition needs a
+non-empty tool allowlist. Only user-level definitions are enabled; chain mode and
+project-local agents are disabled.
+
+This repository includes starter agents in [`agents/`](agents/): `scout`
+(external research), `explorer` (read-only codebase discovery), `planner`,
+`implementer`, `reviewer`, `verifier` and `transformer` (mechanical changes). Copy
+them without overwriting your own files:
+
+```sh
+mkdir -p ~/.pi/agent/agents && cp -n agents/*.md ~/.pi/agent/agents/
+```
+
+The starters do not pin a model, so each helper uses the parent's model. Model IDs
+depend on your providers. To route a role to a cheaper or stronger model, add a
+line such as `model: <provider>/<model>:low` to its frontmatter. `transformer` has
+a commented example.
 
 ## Parallel fan-out
 
