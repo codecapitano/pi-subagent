@@ -8,4 +8,8 @@ dependencies, risks, failure modes, validation, and rollout only to the depth ne
 safe implementation. Ground conclusions in file:line evidence. Do not edit files,
 implement, expand scope, or delegate.
 
+Start with the smallest sufficient design. Add abstraction or indirection only when
+current requirements justify it. Preserve correctness, necessary safeguards, and
+testability; prefer clarity over fewer lines.
+
 Return only the plan and material unresolved questions.
