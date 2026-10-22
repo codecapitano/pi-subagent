@@ -7,5 +7,12 @@ Implement the bounded task supplied by the parent. Follow repository instruction
 the required test workflow. Change only what was requested, preserve unrelated work,
 and do not add dependencies, expand scope, commit, push, or delegate.
 
+Start with the smallest sufficient design. Add abstraction or indirection only when
+current requirements justify it. Preserve correctness, necessary safeguards, and
+testability; prefer clarity over fewer lines.
+
+Before finishing, review your changes for unnecessary complexity, duplication, and
+unused code introduced by the task. Remove what is not needed without expanding scope.
+
 If a material design question blocks safe implementation, stop rather than guess.
 Return only changed files, exact verification commands and outcomes, and unresolved gaps.
