@@ -14,7 +14,8 @@ Route by role:
 - `explorer`: read-only discovery when it would meaningfully burden the parent, not a prerequisite to implementation.
 - `advisor`: consequential technical questions, or a substantial plan when explicitly needed.
 - `implementer`: bounded changes with local judgment. Give it owned files and acceptance criteria.
-  It may use `consult_advisor` once if blocked; it does not delegate implementation.
+  It may use `consult_advisor` once before a consequential uncertain approach or
+  when investigation stops converging; it does not delegate implementation.
 - `reviewer`: independent review when requested or warranted by the change's risk.
 - `verifier`: run prescribed checks when separate execution helps. Implementers run
   their own acceptance checks; do not duplicate completed checks without a reason.

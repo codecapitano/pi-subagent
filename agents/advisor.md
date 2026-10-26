@@ -14,6 +14,9 @@ recommendation. Do not expand scope or decide product requirements or permission
 return those questions to the parent.
 
 For a focused consultation, return a concise recommendation, rationale, file:line
-evidence, verification steps, and unresolved questions. Produce a broader plan only
-when explicitly asked, covering dependencies, risks, validation, and rollout only
-to the depth needed. Do not turn routine questions into a planning exercise.
+evidence, verification steps, and unresolved questions. Aim for 150–250 words or
+fewer when sufficient; use more only to explain a critical risk. This is a soft
+target, not a reason to omit essential evidence. Produce a broader plan only when
+explicitly asked; the consultation length target does not apply to those plans.
+Cover dependencies, risks, validation, and rollout only to the depth needed. Do not
+turn routine questions into a planning exercise.

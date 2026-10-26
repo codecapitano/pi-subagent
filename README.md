@@ -139,12 +139,20 @@ a commented example.
 ## Advisor consultation
 
 The `implementer` starter can make local implementation choices and call
-`consult_advisor` when consequential technical uncertainty blocks progress. It does
-not need an exact reference pattern. Routine choices do not need consultation;
+`consult_advisor` after initial inspection, before committing to a consequential
+approach with unresolved assumptions or compatibility risks, or when investigation
+stops converging. It does not need an exact reference pattern. Routine choices do not need consultation;
 product decisions, permissions, and scope changes go back to the parent.
 
 `consult_advisor` takes a self-contained `task` and optional `cwd`. Include the
-question, file evidence, options considered, and proposed choice. The tool always
+original objective, acceptance criteria, constraints, current changes, file evidence,
+and exact failure output when applicable. State the decision needed, options, and
+proposed approach. The advisor does not inherit the worker's conversation. Keep the
+brief focused rather than copying the full transcript. Focused advice aims for
+150–250 words or fewer when sufficient, with room for critical risks; explicitly
+requested plans can be longer. This is a prompt target, not a runtime token cap.
+
+The tool always
 runs the user-level agent named `advisor`. It forces `read,grep,find,ls` and disables
 MCP for that process, even if the advisor definition lists other tools. It uses the
 advisor's model assignment, or inherits the caller's model and effort if unpinned.

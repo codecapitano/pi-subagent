@@ -566,14 +566,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "consult_advisor",
 		label: "Consult advisor",
-		description: "Consult the user-level advisor for a bounded read-only decision. Supply a self-contained question, evidence, options, and proposed choice.",
+		description: "Consult the user-level advisor for a bounded read-only decision. It does not inherit your conversation; supply the objective, acceptance criteria, constraints, current changes, evidence, and proposed approach.",
 		promptSnippet: "Ask the advisor a focused decision question",
 		promptGuidelines: [
-			"Use consult_advisor for a consequential uncertainty, not routine work. One attempt is allowed per runtime, including failures; escalate further uncertainty to the parent. A consultation adds a child model call; keep the question and evidence focused.",
+			"Consult after initial inspection, before a consequential approach with unresolved assumptions or compatibility risks, or when investigation stops converging. Skip routine work. One attempt is allowed per runtime, including failures; escalate further uncertainty to the parent. Keep the brief focused.",
 			"The advisor recommends; you own the decision and verification. It cannot edit, run shell commands, or delegate.",
 		],
 		parameters: Type.Object({
-			task: Type.String({ description: "Self-contained question, evidence, options, and proposed choice" }),
+			task: Type.String({ description: "Objective, acceptance criteria, constraints, current changes, file evidence and exact failures if any; decision needed, options, and proposed approach" }),
 			cwd: Type.Optional(Type.String({ description: "Working directory for the advisor process" })),
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params, signal, observer, ctx) {
