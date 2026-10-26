@@ -790,6 +790,15 @@ test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is 
 	});
 });
 
+test("advisor correctness guidance is registered for every consultation caller", async () => {
+	await withExtension(undefined, async ({ ext }) => {
+		const guidance = ext.tools.get("consult_advisor").definition.promptGuidelines.join("\n");
+		assert.match(guidance, /Passing supplied tests does not override the requirements/);
+		assert.match(guidance, /Investigate advisor-identified correctness risks/);
+		assert.match(guidance, /blocking gap/);
+	});
+});
+
 test("the tool description lists the available agents so no AGENTS.md roster is needed", async () => {
 	await withExtension(undefined, async ({ tool }) => {
 		assert.match(tool.description, /Available agents: .*worker: test worker/);

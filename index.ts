@@ -571,6 +571,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Consult after initial inspection, before a consequential approach with unresolved assumptions or compatibility risks, or when investigation stops converging. Skip routine work. One attempt is allowed per runtime, including failures; escalate further uncertainty to the parent. Keep the brief focused.",
 			"The advisor recommends; you own the decision and verification. It cannot edit, run shell commands, or delegate.",
+			"Passing supplied tests does not override the requirements. Investigate advisor-identified correctness risks even when tests omit them. Resolve confirmed in-scope defects and add regression coverage when test edits are permitted. If a required fix or test is outside your ownership, or a material correctness risk remains unresolved, return it as a blocking gap; do not claim completion.",
 		],
 		parameters: Type.Object({
 			task: Type.String({ description: "Objective, acceptance criteria, constraints, current changes, file evidence and exact failures if any; decision needed, options, and proposed approach" }),
