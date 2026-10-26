@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Parallel subagents for the Pi coding agent, with a shared FIFO limiter and bounded output.",
   "license": "MIT",
   "private": true,

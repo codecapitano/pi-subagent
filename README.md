@@ -52,10 +52,10 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.2.0
+pi install git:github.com/codecapitano/pi-subagent@v0.3.0
 ```
 
-The `@v0.2.0` tag pins the version. Update by installing a newer tag. Run `/reload`
+The `@v0.3.0` tag pins the version. Update by installing a newer tag. Run `/reload`
 while Pi is idle, or restart Pi. This loads `index.ts` straight from the package;
 it does not copy anything into `~/.pi/agent/extensions/`. Remove it with
 `pi remove git:github.com/codecapitano/pi-subagent`. Packages run code, so read the
@@ -184,8 +184,7 @@ tool list, not `subagent`. A separate small-implementation role is optional; the
 bounded implementer can cover that work too. Keep personal model assignments when
 updating prompts. Install this extension version alongside the updated definitions,
 then run `/reload` while idle or restart Pi. Older versions do not provide the tool.
-The published `v0.2.0` tag does not include advisor consultation; install this checkout
-with the manual installer until a new release is tagged.
+Advisor consultation requires v0.3.0 or later; v0.2.0 does not provide the tool.
 
 ## Parallel fan-out
 
@@ -306,7 +305,7 @@ or tested.
 
 ## Status and known limitations
 
-This is an early release (0.2). Please read these before relying on it:
+This is an early release (0.3). Please read these before relying on it:
 
 - **Package install checked once.** One real Pi session loaded `v0.2.0` through
   `pi -e git:github.com/codecapitano/pi-subagent@v0.2.0`. The model read the agent
