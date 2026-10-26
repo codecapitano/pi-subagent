@@ -106,17 +106,17 @@ The tool also registers its own `promptSnippet` and `promptGuidelines`, which Pi
 the system prompt while the tool is active. Pi's model learns when to delegate, how
 to write a brief and to verify results without any `AGENTS.md` entry. To change the
 policy for your own setup, for example which agent to use for which job, add that to
-your `AGENTS.md`.
+your `AGENTS.md`. See [`docs/agents-md-snippet.md`](docs/agents-md-snippet.md) for examples.
 
 ## Define agents
 
 Agents are Markdown files in `~/.pi/agent/agents/`. Every definition needs a
-non-empty tool allowlist. Only user-level definitions are enabled; chain mode and
-project-local agents are disabled.
+non-empty tool allowlist. Only user-level definitions are enabled.
 
 This repository includes starter agents in [`agents/`](agents/): `scout`
 (external research), `explorer` (read-only codebase discovery), `advisor`,
-`implementer`, `reviewer`, `verifier` and `transformer` (mechanical changes). Copy
+`implementer`, `reviewer` and `verifier`. Their descriptions say when to use each, so no
+routing rules are needed. Copy
 them without overwriting your own files:
 
 ```sh
@@ -129,12 +129,10 @@ An optional `design-reviewer` (UI fidelity and accessibility review) is in
 reach instead of claiming checks passed. I have not verified how Pi treats an
 allowlist entry for a server that is not configured, so try it before relying on it.
 
-For routing rules of your own, see [`docs/agents-md-snippet.md`](docs/agents-md-snippet.md).
-
 The starters do not pin a model, so each helper uses the parent's model. Model IDs
 depend on your providers. To route a role to a cheaper or stronger model, add a
-line such as `model: <provider>/<model>:low` to its frontmatter. `transformer` has
-a commented example.
+line such as `model: <provider>/<model>:low` to its frontmatter, for example a cheaper
+model for `explorer` or `verifier`, or a stronger one for `advisor`. Run `/reload` after.
 
 ## Advisor consultation
 
@@ -152,7 +150,8 @@ brief focused rather than copying the full transcript. Focused advice aims for
 150–250 words or fewer when sufficient, with room for critical risks; explicitly
 requested plans can be longer. This is a prompt target, not a runtime token cap.
 
-The tool always
+`consult_advisor` is inactive by default, so the parent does not see it. It is
+available only to agents that list it in `tools`. It always
 runs the user-level agent named `advisor`. It forces `read,grep,find,ls` and disables
 MCP for that process, even if the advisor definition lists other tools. It uses the
 advisor's model assignment, or inherits the caller's model and effort if unpinned.
@@ -197,7 +196,6 @@ Advisor consultation requires v0.3.0 or later; v0.2.0 does not provide the tool.
 - Parallel calls return when the entire batch finishes. Progress updates are not
   background-job results; there is no start/status/wait job API.
 - Only user-level agent definitions are enabled.
-  Chain mode and project-local agents remain disabled.
 - Every definition must declare a non-empty tool allowlist.
 
 For example, a batch of 32 tasks at default capacity runs at most six children
@@ -318,8 +316,8 @@ This is an early release (0.3). Please read these before relying on it:
   automatic task timeout. A hung child holds a slot until cancelled.
 - **Tests need a Pi installation.** The loader tests read Pi from
   `~/.pi/agent/install`, or from `PI_CORE_DIR`. CI installs Pi 1.3.0 from npm.
-- **Legacy code.** Project-local agents are rejected but still present in the
-  source. Chain calls are rejected, and old chain results render as plain text.
+- **Legacy code.** Old stored calls that use `chain` or a project scope are
+  rejected by a small compatibility check.
 - **Unverified in practice.** The tests use fake child processes. Real provider rate
   limits, throughput and how models use `maxConcurrency` have not been measured.
 
