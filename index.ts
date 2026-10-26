@@ -319,6 +319,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	consultation = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -346,7 +347,8 @@ async function runSingleAgent(
 	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
 		args.push("--thinking", dispatchDefaults.thinkingLevel);
 	}
-	args.push("--tools", agent.tools.join(","));
+	args.push("--tools", consultation ? "read,grep,find,ls" : agent.tools.join(","));
+	if (consultation) args.push("--no-mcp");
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -559,6 +561,50 @@ export default function (pi: ExtensionAPI) {
 	} catch {
 		/* a broken agents directory must not prevent the tool from loading */
 	}
+
+	let consultationAttempted = false;
+	pi.registerTool({
+		name: "consult_advisor",
+		label: "Consult advisor",
+		description: "Consult the user-level advisor for a bounded read-only decision. Supply a self-contained question, evidence, options, and proposed choice.",
+		promptSnippet: "Ask the advisor a focused decision question",
+		promptGuidelines: [
+			"Use consult_advisor for a consequential uncertainty, not routine work. One attempt is allowed per runtime, including failures; escalate further uncertainty to the parent. A consultation adds a child model call; keep the question and evidence focused.",
+			"The advisor recommends; you own the decision and verification. It cannot edit, run shell commands, or delegate.",
+		],
+		parameters: Type.Object({
+			task: Type.String({ description: "Self-contained question, evidence, options, and proposed choice" }),
+			cwd: Type.Optional(Type.String({ description: "Working directory for the advisor process" })),
+		}, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, observer, ctx) {
+			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
+				mode: "single", agentScope: "user", projectAgentsDir: null, results,
+			});
+			if (consultationAttempted) return {
+				content: [{ type: "text", text: "Advisor consultation already attempted in this runtime. Escalate to the parent instead of retrying." }],
+				details: makeDetails([]), isError: true,
+			};
+			// Claim before discovery, preparation, or any await. Failures also consume the attempt.
+			consultationAttempted = true;
+			if (configError) return {
+				content: [{ type: "text", text: `Advisor consultation is disabled: ${configError}` }],
+				details: makeDetails([]), isError: true,
+			};
+			const onUpdate: OnUpdateCallback | undefined = observer ? (partial) => {
+				try { observer(partial); } catch { /* ignore observer failures */ }
+			} : undefined;
+			const result = await runSingleAgent(
+				runner, ctx.cwd,
+				{ model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined, thinkingLevel: ctx.thinkingLevel },
+				discoverAgents(ctx.cwd, "user").agents, "advisor", params.task, params.cwd,
+				undefined, signal, onUpdate, makeDetails, true,
+			);
+			return {
+				content: [{ type: "text", text: truncateModelVisibleOutput(getResultOutput(result)) }],
+				details: makeDetails([result]), usage: sumUsage([result]), isError: isFailedResult(result),
+			};
+		},
+	});
 
 	pi.registerTool({
 		name: "subagent",

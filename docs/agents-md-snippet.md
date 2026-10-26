@@ -12,13 +12,16 @@ Route by role:
 
 - `scout`: external documentation and dependency research.
 - `explorer`: read-only discovery in this codebase.
-- `planner`: only when a separate planning pass is justified.
-- `implementer`: scoped changes that need judgment. Give it owned files.
+- `advisor`: consequential technical questions, or a substantial plan when explicitly needed.
+- `implementer`: bounded changes with local judgment. Give it owned files and acceptance criteria.
+  It may use `consult_advisor` once if blocked; it does not delegate implementation.
 - `reviewer`: second opinion on risky or finished work.
 - `verifier`: run the exact checks you specify and report the evidence.
 
 Give each subagent a closed brief with scope, constraints, owned files and the exact
 return shape. Run independent read-only tasks in one parallel call. Never let parallel
 tasks edit the same files. Before declaring success, inspect the combined diff and
-check the acceptance criteria yourself.
+check the acceptance criteria yourself. Do not run a mandatory planning or review
+pipeline for modest tasks. Keep stronger models for uncertainty or consequential
+review, and escalate unresolved worker questions to the parent.
 ```

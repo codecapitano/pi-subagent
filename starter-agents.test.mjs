@@ -11,7 +11,7 @@ const agentFiles = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
 test("starter agents are present", () => {
 	assert.deepEqual(
 		agentFiles.sort(),
-		["explorer.md", "implementer.md", "planner.md", "reviewer.md", "scout.md", "transformer.md", "verifier.md"],
+		["advisor.md", "explorer.md", "implementer.md", "reviewer.md", "scout.md", "transformer.md", "verifier.md"],
 	);
 });
 
@@ -29,6 +29,13 @@ for (const file of agentFiles) {
 		assert.ok(match[2].trim().length > 0, "prompt body");
 	});
 }
+
+test("implementer can consult without general delegation and advisor stays read-only", () => {
+	const implementer = fs.readFileSync(path.join(agentsDir, "implementer.md"), "utf8");
+	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, consult_advisor\]$/m);
+	const advisor = fs.readFileSync(path.join(agentsDir, "advisor.md"), "utf8");
+	assert.match(advisor, /^tools: \[read, grep, find, ls\]$/m);
+});
 
 // Everything published must be free of machine-specific or private details.
 const FORBIDDEN = [

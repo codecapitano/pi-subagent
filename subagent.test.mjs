@@ -675,6 +675,105 @@ const pidAlive = (pid) => {
 };
 const P = (n, extra = "") => ({ agent: "worker", task: `t${n} ${extra}` });
 
+test("consult_advisor fixes its target and forces read-only tools with MCP disabled", async () => {
+	await withExtension(undefined, async ({ e, ext }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor", "Advisor marker").replace("tools: read", "tools: bash,write,edit,subagent,consult_advisor"));
+		const tool = ext.tools.get("consult_advisor")?.definition;
+		assert.ok(tool, "consult_advisor must be registered");
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["cwd", "task"]);
+		const result = await tool.execute("id", { task: "question", cwd: path.join(e.root, "b"), agent: "worker" }, undefined, undefined, { cwd: e.root });
+		assert.equal(result.details.results[0].agent, "advisor");
+		assert.equal(result.details.results[0].agentSource, "user");
+		assert.match(text(result), /--tools read,grep,find,ls --no-mcp/);
+		assert.match(text(result), new RegExp(`cwd=${path.join(e.root, "b")}`));
+		assert.ok(!result.isError);
+	});
+});
+
+test("consult_advisor claims its only attempt before concurrent calls and keeps it after failure", async () => {
+	await withExtension(undefined, async ({ e, ext, events }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
+		const tool = ext.tools.get("consult_advisor").definition;
+		const call = (task) => tool.execute("id", { task }, undefined, undefined, { cwd: e.root });
+		const first = call("sleep:80 fail");
+		const second = await call("second");
+		assert.equal(second.isError, true);
+		assert.match(text(second), /already.*attempt|attempt.*used/i);
+		assert.match(text(second), /escalate.*parent/i);
+		await until(() => events().some((e) => e.kind === "S"));
+		assert.equal((await first).isError, true);
+		assert.equal((await call("third")).isError, true);
+		assert.equal(events().filter((e) => e.kind === "S").length, 1);
+	});
+});
+
+test("consult_advisor reports a missing user advisor and consumes the failed attempt", async () => {
+	await withExtension(undefined, async ({ e, ext, events }) => {
+		const projectAgents = path.join(e.root, ".pi", "agents");
+		fs.mkdirSync(projectAgents, { recursive: true });
+		fs.writeFileSync(path.join(projectAgents, "advisor.md"), AGENT("advisor"));
+		const tool = ext.tools.get("consult_advisor").definition;
+		const call = () => tool.execute("id", { task: "question" }, undefined, undefined, { cwd: e.root });
+		const result = await call();
+		assert.equal(result.isError, true);
+		assert.match(text(result), /Unknown agent: "advisor"/);
+		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
+		assert.match(text(await call()), /escalate.*parent/i);
+		assert.equal(events().length, 0);
+	});
+});
+
+test("consult_advisor forwards nested usage and tolerates observer failures", async () => {
+	await withExtension(undefined, async ({ e, ext }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
+		const tool = ext.tools.get("consult_advisor").definition;
+		let updates = 0;
+		const result = await tool.execute("id", { task: "usage" }, undefined, () => {
+			updates++;
+			throw new Error("observer failed");
+		}, { cwd: e.root });
+		assert.ok(updates > 0);
+		assert.equal(result.isError, false);
+		assert.equal(result.usage.input, 40);
+		assert.equal(result.usage.output, 20);
+		assert.equal(result.usage.cost.total, 3.75);
+		assert.deepEqual(result.usage, result.details.results[0].fullUsage);
+	});
+});
+
+test("consult_advisor cancellation forwards accrued usage and consumes the attempt", async () => {
+	await withExtension(undefined, async ({ e, ext }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
+		const tool = ext.tools.get("consult_advisor").definition;
+		const controller = new AbortController();
+		let input = 0;
+		const call = tool.execute("id", { task: "usage-early gate" }, controller.signal, (partial) => {
+			input = partial.details.results[0].fullUsage.input;
+		}, { cwd: e.root });
+		await until(() => input === 10);
+		controller.abort();
+		const result = await call;
+		assert.equal(result.isError, true);
+		assert.equal(result.details.results[0].status, "aborted");
+		assert.equal(result.usage.input, 10);
+		assert.equal(result.usage.cost.total, 0.9375);
+		assert.match(text(await tool.execute("again", { task: "retry" }, undefined, undefined, { cwd: e.root })), /escalate.*parent/i);
+		assert.deepEqual(promptTempDirs(e), []);
+	});
+});
+
+test("general subagent children get consultation only when explicitly allowlisted", async () => {
+	await withExtension(undefined, async ({ e, call }) => {
+		const ordinary = await call({ agent: "worker", task: "ordinary" });
+		assert.match(text(ordinary), /--tools read --append-system-prompt/);
+		assert.doesNotMatch(text(ordinary), /consult_advisor|--no-mcp/);
+		fs.writeFileSync(path.join(e.agentDir, "agents", "worker.md"), AGENT("worker").replace("tools: read", "tools: read,consult_advisor"));
+		const allowed = await call({ agent: "worker", task: "allowed" });
+		assert.match(text(allowed), /--tools read,consult_advisor/);
+		assert.doesNotMatch(text(allowed), /--no-mcp/);
+	});
+});
+
 test("loader registers the subagent tool and a session_shutdown handler", async () => {
 	await withExtension(undefined, async ({ ext, tool }) => {
 		assert.equal(tool.name, "subagent");
