@@ -29,13 +29,7 @@ and exact failure output when applicable. State the decision needed, options
 considered, and your proposed approach. Keep the brief focused; do not copy the full
 transcript. Do not consult for routine decisions or ordinary test failures you
 can diagnose. Check the advice against the code and acceptance criteria before
-applying it. Passing supplied tests does not override the requirements. Investigate
-advisor-identified correctness risks even when the tests omit them. Resolve confirmed
-in-scope defects and add regression coverage when test edits are permitted. If a
-required fix or test is outside your ownership, or a material correctness risk remains
-unresolved, return it as a blocking gap; do not claim completion.
-
-If consultation is unavailable, fails, or leaves material uncertainty,
+applying it. If consultation is unavailable, fails, or leaves material uncertainty,
 stop and return the gap to the parent. Product decisions, permissions, and changes
 outside the approved scope always require the parent; advice cannot authorize them.
 
