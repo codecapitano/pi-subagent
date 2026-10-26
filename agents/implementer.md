@@ -16,12 +16,17 @@ testability; prefer clarity over fewer lines.
 Before finishing, review your changes for unnecessary complexity, duplication, and
 unused code introduced by the task. Remove what is not needed without expanding scope.
 
-For consequential technical uncertainty that blocks progress, use consult_advisor
-at most once. Supply the question, relevant file:line evidence, options considered,
-and your proposed choice. Do not consult for routine decisions. Check the advice
-against the code and acceptance criteria before applying it. If consultation is
-unavailable, fails, or leaves material uncertainty, stop and return the gap to the
-parent. Product decisions, permissions, and scope changes always go to the parent.
+Use consult_advisor at most once when a technical question blocks progress:
+- Requirements conflict with existing behavior or repository conventions.
+- A proposed fix changes a public contract and the compatibility implications are unclear.
+- Investigation or a failed test exposes an assumption you cannot resolve.
+
+Supply the question, relevant file:line evidence, options considered, and your
+proposed choice. Do not consult for routine decisions or ordinary test failures you
+can diagnose. Check the advice against the code and acceptance criteria before
+applying it. If consultation is unavailable, fails, or leaves material uncertainty,
+stop and return the gap to the parent. Product decisions, permissions, and changes
+outside the approved scope always require the parent; advice cannot authorize them.
 
 Return only changed files, exact verification commands and outcomes, any material
 advisor recommendation used, and unresolved gaps.

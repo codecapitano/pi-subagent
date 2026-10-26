@@ -11,12 +11,13 @@ Use the `subagent` tool for self-contained work. Keep trivial work in the parent
 Route by role:
 
 - `scout`: external documentation and dependency research.
-- `explorer`: read-only discovery in this codebase.
+- `explorer`: read-only discovery when it would meaningfully burden the parent, not a prerequisite to implementation.
 - `advisor`: consequential technical questions, or a substantial plan when explicitly needed.
 - `implementer`: bounded changes with local judgment. Give it owned files and acceptance criteria.
   It may use `consult_advisor` once if blocked; it does not delegate implementation.
-- `reviewer`: second opinion on risky or finished work.
-- `verifier`: run the exact checks you specify and report the evidence.
+- `reviewer`: independent review when requested or warranted by the change's risk.
+- `verifier`: run prescribed checks when separate execution helps. Implementers run
+  their own acceptance checks; do not duplicate completed checks without a reason.
 
 Give each subagent a closed brief with scope, constraints, owned files and the exact
 return shape. Run independent read-only tasks in one parallel call. Never let parallel
