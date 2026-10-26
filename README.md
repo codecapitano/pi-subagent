@@ -52,10 +52,10 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.3.1
+pi install git:github.com/codecapitano/pi-subagent@v0.3.2
 ```
 
-The `@v0.3.1` tag pins the version. Update by installing a newer tag. Run `/reload`
+The `@v0.3.2` tag pins the version. Update by installing a newer tag. Run `/reload`
 while Pi is idle, or restart Pi. This loads `index.ts` straight from the package;
 it does not copy anything into `~/.pi/agent/extensions/`. Remove it with
 `pi remove git:github.com/codecapitano/pi-subagent`. Packages run code, so read the
