@@ -799,6 +799,19 @@ test("advisor correctness guidance is registered for every consultation caller",
 	});
 });
 
+test("consult_advisor is inactive by default so the parent does not see it", async () => {
+	await withExtension(undefined, async ({ ext }) => {
+		assert.equal(ext.tools.get("consult_advisor").definition.defaultActive, false);
+	});
+});
+
+test("removed schema fields are not model-visible but old calls still validate", async () => {
+	await withExtension(undefined, async ({ tool }) => {
+		for (const key of ["chain", "agentScope", "confirmProjectAgents"]) assert.equal(key in tool.parameters.properties, false);
+		assert.notEqual(tool.parameters.additionalProperties, false);
+	});
+});
+
 test("the tool description lists the available agents so no AGENTS.md roster is needed", async () => {
 	await withExtension(undefined, async ({ tool }) => {
 		assert.match(tool.description, /Available agents: .*worker: test worker/);

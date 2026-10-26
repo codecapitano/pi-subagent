@@ -11,7 +11,7 @@ const agentFiles = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
 test("starter agents are present", () => {
 	assert.deepEqual(
 		agentFiles.sort(),
-		["advisor.md", "explorer.md", "implementer.md", "reviewer.md", "scout.md", "transformer.md", "verifier.md"],
+		["advisor.md", "explorer.md", "implementer.md", "reviewer.md", "scout.md", "verifier.md"],
 	);
 });
 

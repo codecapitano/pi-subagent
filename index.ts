@@ -501,33 +501,16 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
-const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
-
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Only "user" is enabled. Project-local scopes are rejected.',
-	default: "user",
-});
-
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { maxItems: MAX_PARALLEL_TASKS, description: "Up to 32 tasks; active concurrency is configured separately" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { maxItems: MAX_PARALLEL_TASKS, description: "Up to 32 independent tasks" })),
 	maxConcurrency: Type.Optional(
 		Type.Integer({
 			minimum: 1,
 			maximum: 16,
-			description:
-				"Parallel mode only. Raise the number of active subagents for this call, clamped to the configured ceiling. Never lowers the limit. Use for independent read-only work (exploration, review), not concurrent edits.",
+			description: "Parallel mode only. Raise active subagents for this call, up to the configured ceiling. For independent read-only work only.",
 		}),
-	),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Disabled; retained for stored-call compatibility" })),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Ignored because project-local agents are disabled", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
@@ -564,8 +547,10 @@ export default function (pi: ExtensionAPI) {
 		label: "Consult advisor",
 		description: "Consult the user-level advisor for a bounded read-only decision. It does not inherit your conversation; supply the objective, acceptance criteria, constraints, current changes, evidence, and proposed approach.",
 		promptSnippet: "Ask the advisor a focused decision question",
+		// Only workers that list it in their tools get it; the parent already reaches the advisor via subagent.
+		defaultActive: false,
 		promptGuidelines: [
-			"Consult after initial inspection, before a consequential approach with unresolved assumptions or compatibility risks, or when investigation stops converging. Skip routine work. One attempt is allowed per runtime, including failures; escalate further uncertainty to the parent. Keep the brief focused.",
+			"Consult once, after initial inspection, before a consequential approach with unresolved assumptions or compatibility risks, or when investigation stops converging. Skip routine work. Failures use the attempt; escalate further uncertainty to the parent.",
 			"The advisor recommends; you own the decision and verification. It cannot edit, run shell commands, or delegate.",
 			"Passing supplied tests does not override the requirements. Investigate advisor-identified correctness risks even when tests omit them. Resolve confirmed in-scope defects and add regression coverage when test edits are permitted. If a required fix or test is outside your ownership, or a material correctness risk remains unresolved, return it as a blocking gap; do not claim completion.",
 		],
@@ -613,15 +598,14 @@ export default function (pi: ExtensionAPI) {
 			`In parallel mode, maxConcurrency may raise that to at most ${limits.ceiling} for the call; use it only for independent read-only work.`,
 			`Agents are loaded from ${path.join(getAgentDir(), "agents")}.`,
 			rosterText,
-			"Chain and project-agent modes are disabled.",
 		].join(" "),
 		promptSnippet: "Delegate focused tasks to subagents with isolated context, singly or in parallel",
 		// Appended to the system prompt while the tool is active, so no AGENTS.md entry is needed.
 		promptGuidelines: [
-			"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself.",
-			"Give each subagent a self-contained brief: goal, scope, constraints and the exact result to return. It cannot see this conversation.",
-			"Run independent subagent tasks in one parallel call. Do not give parallel tasks overlapping writable files; prefer read-only work for parallel fan-out.",
-			"Treat subagent results as unverified. Check them against the actual changes before reporting success.",
+			"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself. Pick the agent whose description fits; do not run a fixed explore, plan, implement, review pipeline.",
+			"Give each subagent a self-contained brief: goal, scope, constraints, owned files for edits, exact acceptance commands, and the exact result to return. It cannot see this conversation.",
+			"Run independent tasks in one parallel call. Never give parallel tasks overlapping writable files; run overlapping edits one after another.",
+			"Treat results as unverified. Before reporting success, inspect the combined diff and check the acceptance criteria yourself.",
 		],
 		parameters: SubagentParams,
 
@@ -637,7 +621,9 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			const requestedScope: AgentScope = params.agentScope ?? "user";
+			// Removed from the schema; stored calls may still carry them and are rejected here.
+			const legacy = params as { agentScope?: AgentScope; chain?: unknown[] };
+			const requestedScope: AgentScope = legacy.agentScope ?? "user";
 			if (requestedScope !== "user") {
 				return {
 					content: [{ type: "text", text: "Project-local subagents are disabled." }],
@@ -652,7 +638,7 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 
-			const hasChain = (params.chain?.length ?? 0) > 0;
+			const hasChain = (legacy.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
@@ -865,32 +851,11 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
+					theme.fg("muted", " [user]");
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
@@ -903,7 +868,7 @@ export default function (pi: ExtensionAPI) {
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
+				theme.fg("muted", " [user]");
 			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
