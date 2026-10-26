@@ -318,8 +318,8 @@ This is an early release (0.3). Please read these before relying on it:
   automatic task timeout. A hung child holds a slot until cancelled.
 - **Tests need a Pi installation.** The loader tests read Pi from
   `~/.pi/agent/install`, or from `PI_CORE_DIR`. CI installs Pi 1.3.0 from npm.
-- **Legacy code.** Chain mode and project-local agents are rejected but still
-  present in the source, for compatibility with stored calls.
+- **Legacy code.** Project-local agents are rejected but still present in the
+  source. Chain calls are rejected, and old chain results render as plain text.
 - **Unverified in practice.** The tests use fake child processes. Real provider rate
   limits, throughput and how models use `maxConcurrency` have not been measured.
 
