@@ -30,6 +30,8 @@ Tool allowlists limit what an agent can call. They are not a sandbox.
 ## What this extension adds
 
 - Single calls and parallel batches of up to 32 tasks.
+- One focused, read-only advisor consultation per worker runtime, without granting
+  the worker general delegation access.
 - A shared limiter keeps active helpers bounded (default 6). Extra tasks wait in
   order.
 - The agent can raise the limit for one call with `maxConcurrency`, up to a
@@ -113,7 +115,7 @@ non-empty tool allowlist. Only user-level definitions are enabled; chain mode an
 project-local agents are disabled.
 
 This repository includes starter agents in [`agents/`](agents/): `scout`
-(external research), `explorer` (read-only codebase discovery), `planner`,
+(external research), `explorer` (read-only codebase discovery), `advisor`,
 `implementer`, `reviewer`, `verifier` and `transformer` (mechanical changes). Copy
 them without overwriting your own files:
 
@@ -133,6 +135,57 @@ The starters do not pin a model, so each helper uses the parent's model. Model I
 depend on your providers. To route a role to a cheaper or stronger model, add a
 line such as `model: <provider>/<model>:low` to its frontmatter. `transformer` has
 a commented example.
+
+## Advisor consultation
+
+The `implementer` starter can make local implementation choices and call
+`consult_advisor` after initial inspection, before committing to a consequential
+approach with unresolved assumptions or compatibility risks, or when investigation
+stops converging. It does not need an exact reference pattern. Routine choices do not need consultation;
+product decisions, permissions, and scope changes go back to the parent.
+
+`consult_advisor` takes a self-contained `task` and optional `cwd`. Include the
+original objective, acceptance criteria, constraints, current changes, file evidence,
+and exact failure output when applicable. State the decision needed, options, and
+proposed approach. The advisor does not inherit the worker's conversation. Keep the
+brief focused rather than copying the full transcript. Focused advice aims for
+150–250 words or fewer when sufficient, with room for critical risks; explicitly
+requested plans can be longer. This is a prompt target, not a runtime token cap.
+
+The tool always
+runs the user-level agent named `advisor`. It forces `read,grep,find,ls` and disables
+MCP for that process, even if the advisor definition lists other tools. It uses the
+advisor's model assignment, or inherits the caller's model and effort if unpinned.
+Pin a stronger model on the advisor if you want a cheaper implementer to escalate.
+
+Only one attempt is allowed per extension runtime, including failed or cancelled
+attempts. Concurrent requests cannot spend it twice. Each worker is a fresh process,
+so it gets its own attempt. In an interactive parent this allowance lasts until
+runtime replacement, such as reload; the parent can use ordinary `subagent` calls
+for separate advice or planning tasks. The advisor cannot call tools to edit, run
+shell commands, or delegate during a consultation. This is a tool restriction, not
+an operating-system sandbox; installed extensions still run with user permissions.
+
+Consultations reuse the child runner, cancellation, output bounds, and usage
+accounting. Limits remain per process: six workers consulting at once can create
+six additional advisor processes. There is no machine-wide limit or automatic
+consultation timeout. Existing descendant-process cleanup limitations still apply.
+
+### Migrate existing definitions
+
+The advisor replaces the starter planner and handles substantial planning only
+when explicitly requested. Back up your definitions, copy `agents/advisor.md`, and
+transfer any planner model assignment to it. Remove the old `planner.md` only after
+updating your routing instructions. Copying starters with `cp -n` does not remove or
+update existing definitions.
+
+Update your implementer prompt from the starter and add `consult_advisor` to its
+tool list, not `subagent`. A separate small-implementation role is optional; the
+bounded implementer can cover that work too. Keep personal model assignments when
+updating prompts. Install this extension version alongside the updated definitions,
+then run `/reload` while idle or restart Pi. Older versions do not provide the tool.
+The published `v0.2.0` tag does not include advisor consultation; install this checkout
+with the manual installer until a new release is tagged.
 
 ## Parallel fan-out
 
