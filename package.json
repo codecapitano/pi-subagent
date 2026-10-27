@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent",
-  "version": "0.5.0",
+  "version": "0.4.0",
   "description": "Parallel subagents for the Pi coding agent, with a shared FIFO limiter and bounded output.",
   "license": "MIT",
   "private": true,
@@ -31,7 +31,6 @@
     "agents.ts",
     "lifecycle.mjs",
     "output.mjs",
-    "worktree.mjs",
     "agents",
     "README.md",
     "LICENSE"

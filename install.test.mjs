@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const source = path.dirname(fileURLToPath(import.meta.url));
-const files = ["index.ts", "agents.ts", "lifecycle.mjs", "output.mjs", "worktree.mjs", "subagent.test.mjs", "output.test.mjs", "worktree.test.mjs", "README.md", "LICENSE"];
+const files = ["index.ts", "agents.ts", "lifecycle.mjs", "output.mjs", "subagent.test.mjs", "output.test.mjs", "README.md", "LICENSE"];
 function environment(fn) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-install-test-"));
 	const destination = path.join(root, "installed");

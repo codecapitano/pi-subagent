@@ -2,34 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseConcurrency } from "./lifecycle.mjs";
 
-test("concurrency defaults to base 6 and ceiling 8 when unset or empty", () => {
-	assert.deepEqual(parseConcurrency({}), { base: 6, ceiling: 8 });
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: "", PI_SUBAGENT_CONCURRENCY_CEILING: "" }), { base: 6, ceiling: 8 });
+test("concurrency defaults to 4 when unset, empty or not a number", () => {
+	for (const value of [undefined, "", " ", "abc"]) {
+		assert.equal(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: value }), 4, `value ${JSON.stringify(value)}`);
+	}
+	assert.equal(parseConcurrency({}), 4);
 });
 
-test("concurrency accepts base integers 1 through 16; an unset ceiling never sits below the base", () => {
-	for (const n of Array.from({ length: 16 }, (_, i) => i + 1)) {
-		assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: String(n) }), { base: n, ceiling: Math.max(n, 8) });
-	}
-});
-
-test("ceiling is configurable and must not be below the base", () => {
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: "12" }), { base: 6, ceiling: 12 });
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: "2", PI_SUBAGENT_CONCURRENCY_CEILING: "2" }), { base: 2, ceiling: 2 });
-	assert.throws(() => parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: "5" }), /PI_SUBAGENT_CONCURRENCY_CEILING.*below/);
-	for (const bad of ["0", "17", "abc"]) {
-		assert.throws(() => parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: bad }), /PI_SUBAGENT_CONCURRENCY_CEILING.*integer from 1 to 16/);
-	}
-});
-
-test("concurrency rejects invalid values with a clear error naming the variable", () => {
-	for (const bad of ["0", "17", "-1", "2.5", "abc", "1e1", " ", "0x2", "2 3"]) {
-		assert.throws(
-			() => parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: bad }),
-			/PI_SUBAGENT_MAX_CONCURRENCY.*integer from 1 to 16/,
-			`value ${JSON.stringify(bad)}`,
-		);
-	}
+test("concurrency is clamped to 1 through 16", () => {
+	const limit = (value) => parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: value });
+	assert.deepEqual(["0", "-3", "1", "7", "16", "17", "99", "2.9"].map(limit), [1, 1, 1, 7, 16, 16, 16, 2]);
 });
 
 // ---------------------------------------------------------------------------
@@ -60,7 +42,7 @@ class FakeProc extends EventEmitter {
 	}
 }
 
-function world(capacity = 4, ceiling = capacity) {
+function world(capacity = 4, kill = undefined) {
 	const w = {
 		procs: [],
 		spawnCalls: [],
@@ -84,7 +66,7 @@ function world(capacity = 4, ceiling = capacity) {
 	};
 	w.runner = createChildRunner({
 		capacity,
-		ceiling,
+		kill,
 		spawn: w.spawn,
 		setTimeout: w.setTimeout,
 		clearTimeout: w.clearTimeout,
@@ -147,61 +129,6 @@ test("capacity limits active children and queued runs start FIFO", async () => {
 	w.procs[3].exit(0);
 	await Promise.all(ps);
 	assert.deepEqual(w.runner.stats(), { active: 0, queued: 0 });
-});
-
-test("raise starts queued work immediately, clamps to the ceiling and never exceeds it", async () => {
-	const w = world(2, 4);
-	const ps = ["a", "b", "c", "d", "e", "f"].map((n) => w.runner.run(spec(n)));
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 2, queued: 4 });
-	const lower = w.runner.raise(12);
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 4, queued: 2 });
-	lower();
-	lower(); // idempotent
-	for (const p of w.procs.slice()) p.exit(0);
-	await tick();
-	// Back to the base limit: only two of the remaining runs start.
-	assert.deepEqual(w.runner.stats(), { active: 2, queued: 0 });
-	for (const p of w.procs.slice(4)) p.exit(0);
-	await Promise.all(ps);
-});
-
-test("lowering a raise kills nothing and grants no new slot until active drops below the base", async () => {
-	const w = world(1, 3);
-	const ps = ["a", "b", "c", "d"].map((n) => w.runner.run(spec(n)));
-	const lower = w.runner.raise(3);
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 3, queued: 1 });
-	lower();
-	assert.ok(w.procs.every((p) => p.kills.length === 0));
-	w.procs[0].exit(0);
-	w.procs[1].exit(0);
-	await tick();
-	assert.equal(w.procs.length, 3); // d still waits: active 1 is not below base 1
-	w.procs[2].exit(0);
-	await tick();
-	assert.equal(w.procs.length, 4);
-	w.procs[3].exit(0);
-	await Promise.all(ps);
-});
-
-test("overlapping raises release independently, even at the same value", async () => {
-	const w = world(1, 4);
-	const first = w.runner.raise(3);
-	const second = w.runner.raise(3);
-	const ps = ["a", "b", "c"].map((n) => w.runner.run(spec(n)));
-	await tick();
-	assert.equal(w.procs.length, 3);
-	first();
-	const late = w.runner.run(spec("d"));
-	await tick();
-	assert.equal(w.procs.length, 3); // second raise still allows 3 active, all slots busy
-	second();
-	for (const p of w.procs) p.exit(0);
-	await tick();
-	w.procs[3].exit(0);
-	await Promise.all([...ps, late]);
 });
 
 test("prepare failure is reported as failed without spawning and frees the slot", async () => {
@@ -391,6 +318,40 @@ test("no KILL is sent when the child already exited before the grace timer fires
 	await p;
 });
 
+test("a detached child is signalled as a process group, SIGKILL included", async () => {
+	const groupKills = [];
+	const w = world(4, (pid, sig) => groupKills.push([pid, sig]));
+	const ac = new AbortController();
+	const p = w.runner.run({ ...spec("a", { signal: ac.signal }), prepare: () => ({ command: "pi", args: [], cwd: "/", detached: true, env: { X: "1" } }) });
+	await tick();
+	assert.equal(w.spawnCalls[0].options.detached, true);
+	assert.deepEqual(w.spawnCalls[0].options.env, { X: "1" });
+	ac.abort();
+	// The group leader may be gone while a descendant still holds the pipes open.
+	w.procs[0].exitCode = 0;
+	w.timers[0].fn();
+	assert.deepEqual(groupKills, [[-1000, "SIGTERM"], [-1000, "SIGKILL"]]);
+	assert.deepEqual(w.procs[0].kills, []);
+	w.procs[0].emit("close", 0, null);
+	assert.equal((await p).status, "aborted");
+});
+
+test("a group kill that fails falls back to the direct pid, and children are not detached by default", async () => {
+	const w = world(4, () => { throw Object.assign(new Error("no such process"), { code: "ESRCH" }); });
+	const ac = new AbortController();
+	const detached = w.runner.run({ ...spec("a", { signal: ac.signal }), prepare: () => ({ command: "pi", args: [], cwd: "/", detached: true }) });
+	const plain = w.runner.run(spec("b"));
+	await tick();
+	assert.equal(w.spawnCalls[0].options.detached, true);
+	assert.equal(w.spawnCalls[1].options.detached, false);
+	ac.abort();
+	assert.deepEqual(w.procs[0].kills, ["SIGTERM"]);
+	w.procs[0].exit(null, "SIGTERM");
+	w.procs[1].exit(0);
+	assert.equal((await detached).status, "aborted");
+	assert.equal((await plain).status, "completed");
+});
+
 test("a throwing kill does not break settlement", async () => {
 	const w = world();
 	const ac = new AbortController();
@@ -546,11 +507,11 @@ const { loadExtensions } = await import(`${PI_CORE}/dist/core/extensions/loader.
 
 const FAKE_PI = `
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 const task = process.argv.at(-1).replace(/^Task: /, "");
 const log = process.env.FAKE_PI_LOG;
 const note = (k) => fs.appendFileSync(log, k + " " + process.pid + " " + JSON.stringify(task) + "\\n");
 note("S");
-if (/touch/.test(task)) fs.writeFileSync("touched-" + process.pid + ".txt", "x");
 const U = (n, extra = {}) => ({ input: 10 * n, output: 5 * n, cacheRead: 3 * n, cacheWrite: 2 * n, totalTokens: 20 * n, cost: { input: 0.25 * n, output: 0.5 * n, cacheRead: 0.125 * n, cacheWrite: 0.0625 * n, total: 0.9375 * n }, ...extra });
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 const assistantUsage = (u) => ({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "step" }], usage: u, model: "fake", stopReason: "toolUse" } });
@@ -559,7 +520,7 @@ let done = false;
 const finish = (code) => {
 	if (done) return;
 	done = true;
-	const text = /huge/.test(task) ? "answer " + "é".repeat(1024 * 1024) : /big/.test(task) ? "x".repeat(40000) : "cwd=" + process.cwd() + " task=" + task + " args=" + process.argv.slice(2, -1).join(" ");
+	const text = /huge/.test(task) ? "answer " + "é".repeat(1024 * 1024) : /big/.test(task) ? "x".repeat(40000) : "cwd=" + process.cwd() + " task=" + task + " args=" + process.argv.slice(2, -1).join(" ") + (/showenv/.test(task) ? " depth=" + process.env.PI_SUBAGENT_DEPTH + " groupLeader=" + (Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)])) === process.pid) : "");
 	if (/noisy/.test(task)) for (let i = 0; i < 100; i++) process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "n".repeat(20000) }], usage: { input: 1, output: 1 }, stopReason: "stop" } }) + "\\n");
 	if (/usage(?!-early)/.test(task)) {
 		emit(assistantUsage(U(1, { reasoning: 2, cacheWrite1h: 1 })));
@@ -581,68 +542,6 @@ if (/gate/.test(task)) {
 } else setTimeout(() => finish(/fail/.test(task) ? 3 : 0), m ? Number(m[1]) : 0);
 `;
 
-// Fake RPC child: reads a `prompt` command on stdin, optionally asks the parent, then settles.
-const FAKE_RPC = `
-import fs from "node:fs";
-const log = process.env.FAKE_PI_LOG;
-const note = (k, extra = "") => fs.appendFileSync(log, k + " " + process.pid + " " + JSON.stringify(extra) + "\\n");
-const emit = (record) => process.stdout.write(JSON.stringify(record) + "\\n");
-const pending = new Map();
-let next = 1;
-let task = "";
-let buffer = "";
-note("S", process.argv.slice(2).join(" "));
-process.on("SIGTERM", () => { note("T"); process.exit(0); });
-process.stdin.on("end", () => { note("E"); process.exit(0); });
-process.stdin.on("data", (chunk) => {
-	buffer += chunk;
-	let at;
-	while ((at = buffer.indexOf("\\n")) >= 0) {
-		const record = JSON.parse(buffer.slice(0, at));
-		buffer = buffer.slice(at + 1);
-		if (record.type === "prompt") {
-			task = record.message;
-			if (/reject/.test(task)) { emit({ id: record.id, type: "response", command: "prompt", success: false, error: "no model" }); continue; }
-			if (/handled/.test(task)) { emit({ id: record.id, type: "response", command: "prompt", success: true, data: { disposition: "handled" } }); continue; }
-			emit({ id: record.id, type: "response", command: "prompt", success: true, data: { disposition: "started" } });
-			run();
-		} else if (record.type === "extension_ui_response") {
-			const resolve = pending.get(record.id);
-			pending.delete(record.id);
-			resolve?.(record);
-		}
-	}
-});
-const dialog = (method, title, timeout) => new Promise((resolve) => {
-	const id = "ui-" + next++;
-	pending.set(id, resolve);
-	emit({ type: "extension_ui_request", id, method, title, ...(timeout ? { timeout } : {}) });
-	note("Q", title);
-	// The agent side resolves its own dialog on timeout.
-	if (timeout) setTimeout(() => { if (pending.delete(id)) resolve({ cancelled: true, timedOut: true }); }, timeout);
-});
-async function run() {
-	const parts = [];
-	if (/foreign/.test(task)) parts.push("foreign=" + JSON.stringify(await dialog("select", "Allow thing?")));
-	if (/notify/.test(task)) emit({ type: "extension_ui_request", id: "n1", method: "notify", message: "hi" });
-	const timeout = Number(process.env.PI_SUBAGENT_ASK_TIMEOUT_MS) || undefined;
-	if (/ask now/.test(task)) {
-		const answer = await dialog("input", "ask_parent: which database?", timeout);
-		note("R", answer);
-		parts.push("answer=" + (answer.cancelled ? "none" : answer.value));
-	}
-	if (/gate/.test(task)) while (!fs.existsSync(log + ".release")) await new Promise((r) => setTimeout(r, 10));
-	parts.push("env=" + process.env.PI_SUBAGENT_ASK_PARENT, "args=" + process.argv.slice(2).join(" "));
-	emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: parts.join(" ") }], usage: { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 }, model: "fake", stopReason: "stop" } });
-	emit({ type: "agent_settled", aborted: false });
-}
-`;
-
-const FAKE_DISPATCH = `
-const kind = process.argv.includes("rpc") ? "rpc" : "json";
-await import(new URL("./fake-" + kind + ".mjs", import.meta.url));
-`;
-
 const AGENT = (name, body = "You are a test agent.") =>
 	`---\nname: ${name}\ndescription: test ${name}\ntools: read\n---\n${body}\n`;
 
@@ -659,16 +558,13 @@ function makeEnv() {
 	fs.writeFileSync(path.join(agentDir, "agents", "reviewer.md"), AGENT("reviewer"));
 	fs.writeFileSync(log, "");
 	const fakePi = path.join(root, "fake-pi.mjs");
-	fs.writeFileSync(fakePi, FAKE_DISPATCH);
-	fs.writeFileSync(path.join(root, "fake-json.mjs"), FAKE_PI);
-	fs.writeFileSync(path.join(root, "fake-rpc.mjs"), FAKE_RPC);
-	fs.writeFileSync(path.join(agentDir, "agents", "asker.md"), AGENT("asker").replace("tools: read", "tools: read,ask_parent"));
+	fs.writeFileSync(fakePi, FAKE_PI);
 	return { root, agentDir, tmp, log, fakePi };
 }
 
-const ENV_KEYS = ["PI_CODING_AGENT_DIR", "FAKE_PI_LOG", "TMPDIR", "PI_SUBAGENT_MAX_CONCURRENCY", "PI_SUBAGENT_CONCURRENCY_CEILING", "PI_SUBAGENT_ASK_TIMEOUT_MS"];
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "FAKE_PI_LOG", "TMPDIR", "PI_SUBAGENT_MAX_CONCURRENCY", "PI_SUBAGENT_DEPTH"];
 
-async function withExtension(maxConcurrency, fn, ceiling) {
+async function withExtension(maxConcurrency, fn, depth) {
 	const e = makeEnv();
 	const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 	const savedArgv1 = process.argv[1];
@@ -677,8 +573,8 @@ async function withExtension(maxConcurrency, fn, ceiling) {
 	process.env.TMPDIR = e.tmp;
 	if (maxConcurrency === undefined) delete process.env.PI_SUBAGENT_MAX_CONCURRENCY;
 	else process.env.PI_SUBAGENT_MAX_CONCURRENCY = maxConcurrency;
-	if (ceiling === undefined) delete process.env.PI_SUBAGENT_CONCURRENCY_CEILING;
-	else process.env.PI_SUBAGENT_CONCURRENCY_CEILING = ceiling;
+	if (depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+	else process.env.PI_SUBAGENT_DEPTH = depth;
 	process.argv[1] = e.fakePi;
 	let ext;
 	try {
@@ -688,15 +584,6 @@ async function withExtension(maxConcurrency, fn, ceiling) {
 		const tool = ext.tools.get("subagent").definition;
 		const ctx = { cwd: e.root, model: undefined, thinkingLevel: undefined };
 		const call = (params, signal, onUpdate) => tool.execute("id", params, signal, onUpdate, ctx);
-		// Delivery goes through pi.sendMessage; capture it instead of reaching a session.
-		const messages = [];
-		loaded.runtime.sendMessage = (message, options) => {
-			if (loaded.runtime.failSend) throw new Error("stale");
-			messages.push({ message, options });
-		};
-		const callTool = (name, params, signal) => ext.tools.get(name).definition.execute("id", params, signal, undefined, ctx);
-		// Gated fake children (task contains "gate") finish once this file exists.
-		const release = () => fs.writeFileSync(e.log + ".release", "");
 		const shutdown = async () => {
 			for (const h of ext.handlers.get("session_shutdown") ?? []) await h({ type: "session_shutdown", reason: "reload" }, {});
 		};
@@ -706,7 +593,7 @@ async function withExtension(maxConcurrency, fn, ceiling) {
 				.split("\n")
 				.filter(Boolean)
 				.map((l) => ({ kind: l[0], pid: Number(l.split(" ")[1]) }));
-		await fn({ e, ext, tool, call, shutdown, events, messages, callTool, release, runtime: loaded.runtime });
+		await fn({ e, ext, tool, call, shutdown, events });
 	} finally {
 		try {
 			for (const h of ext?.handlers.get("session_shutdown") ?? []) await h({ type: "session_shutdown", reason: "quit" }, {});
@@ -750,110 +637,12 @@ const pidAlive = (pid) => {
 };
 const P = (n, extra = "") => ({ agent: "worker", task: `t${n} ${extra}` });
 
-test("consult_advisor fixes its target and forces read-only tools with MCP disabled", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor", "Advisor marker").replace("tools: read", "tools: bash,write,edit,subagent,consult_advisor"));
-		const tool = ext.tools.get("consult_advisor")?.definition;
-		assert.ok(tool, "consult_advisor must be registered");
-		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["cwd", "task"]);
-		const result = await tool.execute("id", { task: "question", cwd: path.join(e.root, "b"), agent: "worker" }, undefined, undefined, { cwd: e.root });
-		assert.equal(result.details.results[0].agent, "advisor");
-		assert.equal(result.details.results[0].agentSource, "user");
-		assert.match(text(result), /--tools read,grep,find,ls --no-mcp/);
-		assert.match(text(result), new RegExp(`cwd=${path.join(e.root, "b")}`));
-		assert.ok(!result.isError);
-	});
-});
-
-test("consult_advisor claims its only attempt before concurrent calls and keeps it after failure", async () => {
-	await withExtension(undefined, async ({ e, ext, events }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const call = (task) => tool.execute("id", { task }, undefined, undefined, { cwd: e.root });
-		const first = call("sleep:80 fail");
-		const second = await call("second");
-		assert.equal(second.isError, true);
-		assert.match(text(second), /already.*attempt|attempt.*used/i);
-		assert.match(text(second), /escalate.*parent/i);
-		await until(() => events().some((e) => e.kind === "S"));
-		assert.equal((await first).isError, true);
-		assert.equal((await call("third")).isError, true);
-		assert.equal(events().filter((e) => e.kind === "S").length, 1);
-	});
-});
-
-test("consult_advisor reports a missing user advisor and consumes the failed attempt", async () => {
-	await withExtension(undefined, async ({ e, ext, events }) => {
-		const projectAgents = path.join(e.root, ".pi", "agents");
-		fs.mkdirSync(projectAgents, { recursive: true });
-		fs.writeFileSync(path.join(projectAgents, "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const call = () => tool.execute("id", { task: "question" }, undefined, undefined, { cwd: e.root });
-		const result = await call();
-		assert.equal(result.isError, true);
-		assert.match(text(result), /Unknown agent: "advisor"/);
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		assert.match(text(await call()), /escalate.*parent/i);
-		assert.equal(events().length, 0);
-	});
-});
-
-test("consult_advisor forwards nested usage and tolerates observer failures", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		let updates = 0;
-		const result = await tool.execute("id", { task: "usage" }, undefined, () => {
-			updates++;
-			throw new Error("observer failed");
-		}, { cwd: e.root });
-		assert.ok(updates > 0);
-		assert.equal(result.isError, false);
-		assert.equal(result.usage.input, 40);
-		assert.equal(result.usage.output, 20);
-		assert.equal(result.usage.cost.total, 3.75);
-		assert.deepEqual(result.usage, result.details.results[0].fullUsage);
-	});
-});
-
-test("consult_advisor cancellation forwards accrued usage and consumes the attempt", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const controller = new AbortController();
-		let input = 0;
-		const call = tool.execute("id", { task: "usage-early gate" }, controller.signal, (partial) => {
-			input = partial.details.results[0].fullUsage.input;
-		}, { cwd: e.root });
-		await until(() => input === 10);
-		controller.abort();
-		const result = await call;
-		assert.equal(result.isError, true);
-		assert.equal(result.details.results[0].status, "aborted");
-		assert.equal(result.usage.input, 10);
-		assert.equal(result.usage.cost.total, 0.9375);
-		assert.match(text(await tool.execute("again", { task: "retry" }, undefined, undefined, { cwd: e.root })), /escalate.*parent/i);
-		assert.deepEqual(promptTempDirs(e), []);
-	});
-});
-
-test("general subagent children get consultation only when explicitly allowlisted", async () => {
-	await withExtension(undefined, async ({ e, call }) => {
-		const ordinary = await call({ agent: "worker", task: "ordinary" });
-		assert.match(text(ordinary), /--tools read --append-system-prompt/);
-		assert.doesNotMatch(text(ordinary), /consult_advisor|--no-mcp/);
-		fs.writeFileSync(path.join(e.agentDir, "agents", "worker.md"), AGENT("worker").replace("tools: read", "tools: read,consult_advisor"));
-		const allowed = await call({ agent: "worker", task: "allowed" });
-		assert.match(text(allowed), /--tools read,consult_advisor/);
-		assert.doesNotMatch(text(allowed), /--no-mcp/);
-	});
-});
-
 test("loader registers the subagent tool and a session_shutdown handler", async () => {
 	await withExtension(undefined, async ({ ext, tool }) => {
 		assert.equal(tool.name, "subagent");
 		assert.equal(ext.handlers.get("session_shutdown")?.length, 1);
-		assert.match(tool.description, /maximum 32/);
+		assert.match(tool.description, /maximum 8/);
+		assert.equal(ext.tools.has("consult_advisor"), false);
 	});
 });
 
@@ -865,25 +654,122 @@ test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is 
 	});
 });
 
-test("advisor correctness guidance is registered for every consultation caller", async () => {
-	await withExtension(undefined, async ({ ext }) => {
-		const guidance = ext.tools.get("consult_advisor").definition.promptGuidelines.join("\n");
-		assert.match(guidance, /Passing supplied tests does not override the requirements/);
-		assert.match(guidance, /Investigate advisor-identified correctness risks/);
-		assert.match(guidance, /blocking gap/);
-	});
-});
-
-test("consult_advisor is inactive by default so the parent does not see it", async () => {
-	await withExtension(undefined, async ({ ext }) => {
-		assert.equal(ext.tools.get("consult_advisor").definition.defaultActive, false);
-	});
-});
-
-test("removed schema fields are not model-visible but old calls still validate", async () => {
+test("the schema offers only agent, task, tasks and cwd", async () => {
 	await withExtension(undefined, async ({ tool }) => {
-		for (const key of ["chain", "agentScope", "confirmProjectAgents"]) assert.equal(key in tool.parameters.properties, false);
-		assert.notEqual(tool.parameters.additionalProperties, false);
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["agent", "cwd", "task", "tasks"]);
+		assert.equal(tool.parameters.properties.tasks.maxItems, 8);
+	});
+});
+
+const writeRole = (e, name, tools, description = `test ${name}`) =>
+	fs.writeFileSync(path.join(e.agentDir, "agents", `${name}.md`), `---\nname: ${name}\ndescription: ${description}\ntools: ${tools}\n---\nYou are ${name}.\n`);
+
+test("children receive PI_SUBAGENT_DEPTH, one above the caller, and are detached only from depth 0", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		assert.match(text(await call({ agent: "worker", task: "showenv" })), /depth=1 groupLeader=true/);
+	});
+	await withExtension(undefined, async ({ call }) => {
+		assert.match(text(await call({ agent: "worker", task: "showenv" })), /depth=2 groupLeader=false/);
+	}, "1");
+});
+
+test("at depth 0 every role is listed and callable", async () => {
+	await withExtension(undefined, async ({ e, ext, call }) => {
+		writeRole(e, "editor", "read, edit, write, subagent");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /worker: test worker/);
+		assert.match(description, /editor: test editor/);
+		assert.equal(text(await call({ agent: "editor", task: "go" })).includes("task=go"), true);
+	});
+});
+
+test("at depth 1 only read-only roles are listed and callable, and editors are refused before any spawn", async () => {
+	await withExtension(undefined, async ({ e, call, events }) => {
+		writeRole(e, "advisor", "read, grep, bash");
+		writeRole(e, "editor", "read, edit");
+		writeRole(e, "writer", "read, write");
+		writeRole(e, "delegator", "read, subagent");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /advisor: test advisor/);
+		assert.match(description, /worker: test worker/);
+		assert.doesNotMatch(description, /editor:|writer:|delegator:/);
+		assert.match(description, /read-only roles only/);
+
+		for (const agent of ["editor", "writer", "delegator"]) {
+			const refused = await call({ agent, task: "go" });
+			assert.equal(refused.isError, true);
+			assert.match(text(refused), new RegExp(`read-only roles.*Refused: ${agent}`));
+		}
+		const mixed = await call({ tasks: [{ agent: "worker", task: "fine" }, { agent: "editor", task: "no" }] });
+		assert.equal(mixed.isError, true);
+		assert.equal(events().length, 0, "a refused batch spawns nothing");
+
+		const allowed = await call({ tasks: [{ agent: "advisor", task: "showenv" }, { agent: "worker", task: "showenv" }] });
+		assert.match(text(allowed), /2\/2 succeeded/);
+		assert.match(text(allowed), /depth=2/);
+	}, "1");
+});
+
+for (const depth of ["2", "5"]) {
+	test(`at depth ${depth} the tool refuses with a clear error and never spawns`, async () => {
+		await withExtension(undefined, async ({ call, events }) => {
+			for (const params of [{ agent: "worker", task: "x" }, { tasks: [P(1)] }]) {
+				const r = await call(params);
+				assert.equal(r.isError, true);
+				assert.match(text(r), /nesting is limited to one level/);
+			}
+			assert.equal(events().length, 0);
+		}, depth);
+	});
+}
+
+test("guidelines are parent-oriented at depth 0 and delegation-limited at depth 1", async () => {
+	await withExtension(undefined, async ({ tool }) => {
+		const guidance = tool.promptGuidelines.join("\n");
+		assert.ok(tool.promptGuidelines.length <= 6);
+		assert.match(guidance, /overlapping files/);
+		assert.match(guidance, /settle shared contracts/);
+		assert.match(guidance, /generated files, lockfiles/);
+		assert.match(guidance, /call the advisor once on the combined diff/);
+		assert.match(guidance, /Redirect noisy command output to a file/);
+		assert.match(guidance, /unverified/);
+		assert.doesNotMatch(guidance, /cannot delegate edits/);
+	});
+	await withExtension(undefined, async ({ tool }) => {
+		const guidance = tool.promptGuidelines.join("\n");
+		assert.match(guidance, /Ask the advisor once for a hard decision and the explorer for lookups\. You cannot delegate edits\./);
+		assert.doesNotMatch(guidance, /parallel call|combined diff before reporting done/);
+	}, "1");
+});
+
+test("skipped role files are named in the roster and never block valid roles", async () => {
+	await withExtension(undefined, async ({ e }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "explorer.md"), "---\nname: explorer\ndescription: Look: around\ntools: read\n---\nbody\n");
+		fs.writeFileSync(path.join(e.agentDir, "agents", "notools.md"), "---\nname: notools\ndescription: x\n---\nbody\n");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		assert.deepEqual(loaded.errors, []);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /worker: test worker/);
+		assert.match(description, /Skipped agent files: .*explorer\.md \(invalid frontmatter\)/);
+		assert.match(description, /notools\.md \(missing name, description or tools\)/);
+	});
+	await withExtension(undefined, async ({ tool }) => {
+		assert.doesNotMatch(tool.description, /Skipped/);
+	});
+});
+
+test("the shipped starter roles all load without being skipped", async () => {
+	await withExtension(undefined, async ({ e }) => {
+		const starters = path.join(here, "agents");
+		for (const file of fs.readdirSync(starters).filter((f) => f.endsWith(".md"))) {
+			fs.copyFileSync(path.join(starters, file), path.join(e.agentDir, "agents", file));
+		}
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.doesNotMatch(description, /Skipped/);
+		for (const name of ["advisor", "explorer", "implementer"]) assert.match(description, new RegExp(`${name}: `));
 	});
 });
 
@@ -894,106 +780,32 @@ test("the tool description lists the available agents so no AGENTS.md roster is 
 	});
 });
 
-test("project scope, chain mode and oversized batches are rejected without spawning", async () => {
+test("oversized and ambiguous calls are rejected without spawning", async () => {
 	await withExtension(undefined, async ({ call, events }) => {
-		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "project" })), /Project-local subagents are disabled/);
-		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "both" })), /disabled/);
-		assert.match(text(await call({ chain: [{ agent: "worker", task: "x" }] })), /Chain mode is disabled/);
-		const oversized = await call({ tasks: Array.from({ length: 33 }, (_, n) => P(n)) });
-		assert.match(text(oversized), /Too many parallel tasks \(33\)\. Max is 32/);
+		const oversized = await call({ tasks: Array.from({ length: 9 }, (_, n) => P(n)) });
+		assert.equal(oversized.isError, true);
+		assert.match(text(oversized), /Too many parallel tasks \(9\)\. Max is 8/);
+		assert.match(text(await call({ agent: "worker", task: "x", tasks: [P(1)] })), /Invalid parameters/);
+		assert.match(text(await call({})), /Invalid parameters/);
 		assert.equal(events().length, 0);
 	});
 });
 
-for (const bad of ["0", "17", "abc", "2.5"]) {
-	test(`invalid PI_SUBAGENT_MAX_CONCURRENCY=${bad} fails clearly and never spawns`, async () => {
-		await withExtension(bad, async ({ call, events }) => {
-			for (const params of [{ agent: "worker", task: "x" }, { tasks: [P(1), P(2)] }]) {
-				const r = await call(params);
-				assert.equal(r.isError, true);
-				assert.match(text(r), /PI_SUBAGENT_MAX_CONCURRENCY/);
-			}
-			assert.equal(events().length, 0);
-		});
-	});
-}
-
-for (const capacity of [6, 8, 16]) {
-	test(`a 32-task batch runs at configured capacity ${capacity}`, async () => {
-		await withExtension(capacity === 6 ? undefined : String(capacity), async ({ e, call, events }) => {
-			const pending = call({ tasks: Array.from({ length: 32 }, (_, n) => P(n, "gate")) });
-			await until(() => events().filter((ev) => ev.kind === "S").length === capacity);
-			assert.equal(maxOverlap(events()), capacity);
-			fs.writeFileSync(e.log + ".release", "go");
-			const result = await pending;
-			assert.equal(result.details.results.length, 32);
-			assert.ok(result.details.results.every((r) => r.status === "completed"));
-			assert.equal(maxOverlap(events()), capacity);
-		});
-	});
-}
-
-test("default capacity is 6 for a full parallel batch", async () => {
-	await withExtension(undefined, async ({ call, events }) => {
-		const r = await call({ tasks: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => P(n, "sleep:250")) });
-		assert.match(text(r), /8\/8 succeeded/);
-		assert.equal(maxOverlap(events()), 6);
-	});
-});
-
-for (const [requested, expected] of [[8, 8], [12, 8]]) {
-	test(`maxConcurrency ${requested} raises a parallel call to ${expected} and later calls return to 6`, async () => {
-		await withExtension(undefined, async ({ e, call, events }) => {
-			const pending = call({ maxConcurrency: requested, tasks: Array.from({ length: 16 }, (_, n) => P(n, "gate")) });
-			await until(() => events().filter((ev) => ev.kind === "S").length === expected);
-			assert.equal(maxOverlap(events()), expected);
+for (const [value, expected] of [[undefined, 4], ["2", 2], ["99", 16], ["0", 1], ["abc", 4]]) {
+	test(`PI_SUBAGENT_MAX_CONCURRENCY=${value} gives a limit of ${expected}`, async () => {
+		await withExtension(value, async ({ tool, e, call, events }) => {
+			assert.match(tool.description, new RegExp(`At most ${expected} subagent processes`));
+			const count = Math.min(expected, 8);
+			const pending = call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "gate")) });
+			await until(() => events().filter((ev) => ev.kind === "S").length === count);
+			await sleep(100);
+			assert.equal(maxOverlap(events()), count);
 			fs.writeFileSync(e.log + ".release", "go");
 			assert.ok((await pending).details.results.every((r) => r.status === "completed"));
-			assert.equal(maxOverlap(events()), expected);
-			const before = events().length;
-			await call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "sleep:150")) });
-			assert.equal(maxOverlap(events().slice(before)), 6);
+			assert.equal(maxOverlap(events()), count);
 		});
 	});
 }
-
-test("the result says when maxConcurrency was clamped or could not raise the limit", async () => {
-	await withExtension(undefined, async ({ call }) => {
-		const clamped = await call({ maxConcurrency: 12, tasks: [P(1), P(2)] });
-		assert.match(text(clamped), /maxConcurrency 12 was clamped to the ceiling of 8/);
-		const noop = await call({ maxConcurrency: 4, tasks: [P(1), P(2)] });
-		assert.match(text(noop), /maxConcurrency 4 did not raise the limit/);
-		const honored = await call({ maxConcurrency: 8, tasks: [P(1), P(2)] });
-		assert.doesNotMatch(text(honored), /Note: maxConcurrency/);
-	});
-});
-
-test("maxConcurrency is clamped to a configured ceiling and cannot lower the base", async () => {
-	await withExtension("2", async ({ call, events }) => {
-		await call({ maxConcurrency: 1, tasks: [1, 2, 3, 4].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 2);
-	}, "3");
-	await withExtension("2", async ({ call, events }) => {
-		await call({ maxConcurrency: 10, tasks: [1, 2, 3, 4, 5, 6].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 3);
-	}, "3");
-});
-
-test("a ceiling below the base disables spawning with a clear error", async () => {
-	await withExtension("6", async ({ call, events }) => {
-		const r = await call({ agent: "worker", task: "x" });
-		assert.equal(r.isError, true);
-		assert.match(text(r), /PI_SUBAGENT_CONCURRENCY_CEILING/);
-		assert.equal(events().length, 0);
-	}, "4");
-});
-
-test("configured capacity bounds a single batch", async () => {
-	await withExtension("2", async ({ call, events }) => {
-		await call({ tasks: [1, 2, 3, 4].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 2);
-	});
-});
 
 test("overlapping single and parallel calls share one limiter", async () => {
 	await withExtension("2", async ({ call, events }) => {
@@ -1181,7 +993,7 @@ test("stderr is bounded and omissions are counted in details", async () => {
 
 test("large child errors and failure reasons cannot bypass retained or batch budgets", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: [{ agent: 'worker', task: 'fail-large-error-large-reason' }, ...Array.from({ length: 31 }, (_, n) => P(n))] });
+		const r = await call({ tasks: [{ agent: 'worker', task: 'fail-large-error-large-reason' }, ...Array.from({ length: 7 }, (_, n) => P(n))] });
 		const failed = r.details.results[0];
 		assert.equal(failed.status, 'failed');
 		assert.ok(Buffer.byteLength(failed.errorMessage) <= 64 * 1024);
@@ -1192,7 +1004,7 @@ test("large child errors and failure reasons cannot bypass retained or batch bud
 
 test("short results return unused batch budget to longer results", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: [P(0, 'big'), ...Array.from({ length: 31 }, (_, n) => P(n + 1))] });
+		const r = await call({ tasks: [P(0, 'big'), ...Array.from({ length: 7 }, (_, n) => P(n + 1))] });
 		assert.match(text(r).split('\n\n---\n\n')[0], /x{15000}/);
 		assert.ok(Buffer.byteLength(text(r)) <= 128 * 1024);
 	});
@@ -1200,11 +1012,11 @@ test("short results return unused batch budget to longer results", async () => {
 
 test("a large batch has a fair bounded model-facing output budget", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: Array.from({ length: 32 }, (_, n) => P(n, "big")) });
+		const r = await call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "big")) });
 		assert.ok(Buffer.byteLength(text(r)) <= 128 * 1024);
-		assert.equal((text(r).match(/### \[worker\] completed/g) ?? []).length, 32);
-		assert.equal((text(r).match(/Output truncated/g) ?? []).length, 32);
-		assert.equal(r.details.results.length, 32);
+		assert.equal((text(r).match(/### \[worker\] completed/g) ?? []).length, 8);
+		assert.equal((text(r).match(/Output truncated/g) ?? []).length, 8);
+		assert.equal(r.details.results.length, 8);
 	});
 });
 
@@ -1231,13 +1043,13 @@ test("results without status (older stored calls) still render", async () => {
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const legacy = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, stderr: "", ...extra });
+		const legacy = (extra) => ({ agent: "worker", task: "t", usage, stderr: "", ...extra });
 		const render = (details) =>
 			tool
 				.renderResult({ content: [{ type: "text", text: "x" }], details }, { expanded: false }, theme, {})
 				.render(120)
 				.join("\n");
-		const base = { agentScope: "user", projectAgentsDir: null };
+		const base = {};
 		const out = render({
 			...base,
 			mode: "parallel",
@@ -1266,9 +1078,9 @@ test("results without status (older stored calls) still render", async () => {
 test("rendering uses the retained final answer after history eviction", async () => {
 	await withExtension(undefined, async ({ tool }) => {
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
-		const result = { agent: 'worker', agentSource: 'user', task: 'x', status: 'completed', exitCode: 0, messages: [], stderr: '', finalOutput: 'survived final answer', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
+		const result = { agent: 'worker', task: 'x', status: 'completed', exitCode: 0, messages: [], stderr: '', finalOutput: 'survived final answer', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
 		for (const mode of ['single', 'parallel']) for (const expanded of [false, true]) {
-			const rendered = tool.renderResult({ content: [{ type: 'text', text: 'x' }], details: { mode, agentScope: 'user', projectAgentsDir: null, results: [result] } }, { expanded }, theme, {}).render(120).join('\n');
+			const rendered = tool.renderResult({ content: [{ type: 'text', text: 'x' }], details: { mode, results: [result] } }, { expanded }, theme, {}).render(120).join('\n');
 			assert.match(rendered, /survived final answer/);
 		}
 	});
@@ -1279,8 +1091,8 @@ test("pending, aborted and failed states render explicit icons in both views", a
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const r = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, stderr: "", exitCode: -1, messages: [], ...extra });
-		const base = { agentScope: "user", projectAgentsDir: null };
+		const r = (extra) => ({ agent: "worker", task: "t", usage, stderr: "", exitCode: -1, messages: [], ...extra });
+		const base = {};
 		const render = (details, expanded) =>
 			tool.renderResult({ content: [{ type: "text", text: "x" }], details }, { expanded }, theme, {}).render(120).join("\n");
 		for (const expanded of [false, true]) {
@@ -1372,8 +1184,8 @@ test("legacy results without a retained final answer render all text parts in ex
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 };
 		const parts = (...ts) => [{ role: "assistant", content: ts.map((t) => ({ type: "text", text: t })) }];
-		const legacy = (messages) => ({ agent: "worker", agentSource: "user", task: "t", exitCode: 0, status: "completed", usage, stderr: "", messages });
-		const render = (mode, messages) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, agentScope: "user", projectAgentsDir: null, results: [legacy(messages)] } }, { expanded: true }, theme, {}).render(120).join("\n");
+		const legacy = (messages) => ({ agent: "worker", task: "t", exitCode: 0, status: "completed", usage, stderr: "", messages });
+		const render = (mode, messages) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, results: [legacy(messages)] } }, { expanded: true }, theme, {}).render(120).join("\n");
 		for (const mode of ["single", "parallel"]) {
 			assert.match(render(mode, parts("alpha", "beta")), /alphabeta/);
 			const big = render(mode, parts("a".repeat(40000), "é".repeat(20000)));
@@ -1477,8 +1289,8 @@ test("failed results show diagnostics in single and parallel, collapsed and expa
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const r = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, exitCode: 3, status: "failed", messages: [], stderr: "", ...extra });
-		const render = (mode, result, expanded) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, agentScope: "user", projectAgentsDir: null, results: [result] } }, { expanded }, theme, {}).render(200).join("\n");
+		const r = (extra) => ({ agent: "worker", task: "t", usage, exitCode: 3, status: "failed", messages: [], stderr: "", ...extra });
+		const render = (mode, result, expanded) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, results: [result] } }, { expanded }, theme, {}).render(200).join("\n");
 		for (const mode of ["single", "parallel"]) for (const expanded of [false, true]) {
 			const label = `${mode} expanded=${expanded}`;
 			const stderrOnly = render(mode, r({ stderr: "child crashed: EBADF" }), expanded);
@@ -1499,600 +1311,42 @@ test("failed results show diagnostics in single and parallel, collapsed and expa
 });
 
 // ---------------------------------------------------------------------------
-// Worktree lanes (temporary git repositories; the child process is faked)
+// Process-tree cancellation with real processes (no model calls)
 // ---------------------------------------------------------------------------
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawn as realSpawn } from "node:child_process";
 
-// Isolate from the developer's git configuration (signing, hooks, templates).
-Object.assign(process.env, {
-	GIT_CONFIG_GLOBAL: os.devNull,
-	GIT_CONFIG_NOSYSTEM: "1",
-	GIT_AUTHOR_NAME: "Test",
-	GIT_AUTHOR_EMAIL: "test@users.noreply.github.com",
-	GIT_COMMITTER_NAME: "Test",
-	GIT_COMMITTER_EMAIL: "test@users.noreply.github.com",
-});
-const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-const worktreeCount = (repo) => git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm).length;
-
-async function withLaneRepo(fn) {
-	await withExtension(undefined, async (ctx) => {
-		const repo = path.join(ctx.e.root, "repo");
-		fs.mkdirSync(repo);
-		git(repo, "init", "-q", "-b", "main");
-		fs.writeFileSync(path.join(repo, "file.txt"), "base\n");
-		git(repo, "add", "-A");
-		git(repo, "commit", "-q", "-m", "base");
-		await fn({ ...ctx, repo });
+test("cancelling a detached child that ignores SIGTERM removes its grandchild too", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-tree-"));
+	const pidFile = path.join(root, "pids");
+	const script = path.join(root, "child.mjs");
+	// Stands in for pi: ignores SIGTERM and starts a grandchild that also ignores it and holds the output pipes.
+	fs.writeFileSync(script, `
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+process.on("SIGTERM", () => {});
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "inherit" });
+fs.writeFileSync(process.argv[2], process.pid + " " + grandchild.pid);
+setInterval(() => {}, 1000);
+`);
+	const runner = createChildRunner({ capacity: 1, spawn: realSpawn, killGraceMs: 300 });
+	const controller = new AbortController();
+	const run = runner.run({
+		signal: controller.signal,
+		prepare: () => ({ command: process.execPath, args: [script, pidFile], cwd: root, detached: true }),
 	});
-}
-const lane = (r, index = 0) => r.details.results[index].worktree;
-
-test("isolation and setup are model-visible, and the guidance covers merging and removing lanes", async () => {
-	await withExtension(undefined, async ({ tool }) => {
-		for (const properties of [tool.parameters.properties, tool.parameters.properties.tasks.items.properties]) {
-			assert.deepEqual(properties.isolation.enum, ["worktree"]);
-			assert.equal(properties.setup.type, "string");
-		}
-		const guidance = tool.promptGuidelines.join("\n");
-		assert.match(guidance, /git merge \(no squash\)/);
-		assert.match(guidance, /Remove every lane yourself as soon as its branch is merged/);
-		assert.match(guidance, /Never add --force to remove a dirty lane without asking the user/);
-		assert.match(guidance, /final report lists any lane left in place/);
-	});
-});
-
-test("an isolated task runs in its own lane, is committed, and prints the cleanup commands", async () => {
-	await withLaneRepo(async ({ repo, call, events }) => {
-		const r = await call({ agent: "worker", task: "edit things touch", cwd: repo, isolation: "worktree" });
-		const w = lane(r);
-		assert.equal(r.isError, undefined);
-		assert.match(w.branch, /^subagent\/worker-[0-9a-f]{6}$/);
-		assert.equal(w.path, path.join(path.dirname(repo), `repo-${w.branch.replace("/", "-")}`));
-		assert.equal(w.base, git(repo, "rev-parse", "HEAD"));
-		assert.deepEqual({ commitsAhead: w.commitsAhead, committed: w.committed, dirty: w.dirty, parentDirty: w.parentDirty }, { commitsAhead: 1, committed: true, dirty: false, parentDirty: false });
-		assert.match(git(w.path, "log", "-1", "--format=%s"), /^subagent\(worker\): edit things touch$/);
-
-		// The child ran in the lane and was told so; the recorded task is the caller's original text.
-		const out = text(r);
-		assert.match(out, new RegExp(`cwd=${w.path} task=edit things touch`));
-		assert.match(out, new RegExp(`You are in an isolated worktree on branch ${w.branch}; edit only here\\.`));
-		assert.equal(r.details.results[0].task, "edit things touch");
-		assert.equal(events().length, 2);
-
-		// The header carries the lane, its state and the exact commands.
-		assert.ok(out.startsWith(`Worktree: ${w.path}\nBranch: ${w.branch} (1 commit ahead of ${w.base.slice(0, 7)}, committed by the extension)`));
-		for (const command of w.cleanup) assert.ok(out.includes(`  ${command}`));
-
-		// The parent merges, then the printed commands remove the lane and its branch.
-		git(repo, "merge", "-q", "--no-ff", "-m", "merge lane", w.branch);
-		for (const command of w.cleanup) assert.equal(spawnSync("sh", ["-c", command]).status, 0, command);
-		assert.ok(!fs.existsSync(w.path));
-		assert.equal(git(repo, "branch", "--list", w.branch), "");
-		assert.equal(worktreeCount(repo), 1);
-	});
-});
-
-test("parallel writers get separate lanes that merge without conflict", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const r = await call({ tasks: [1, 2, 3].map((n) => ({ agent: "worker", task: `write ${n} touch`, cwd: repo, isolation: "worktree" })) });
-		const lanes = r.details.results.map((x) => x.worktree);
-		assert.equal(new Set(lanes.map((w) => w.branch)).size, 3);
-		assert.equal(new Set(lanes.map((w) => w.path)).size, 3);
-		assert.deepEqual(lanes.map((w) => w.commitsAhead), [1, 1, 1]);
-		assert.equal(worktreeCount(repo), 4);
-		const out = text(r);
-		for (const w of lanes) {
-			assert.ok(out.includes(`Worktree: ${w.path}`));
-			for (const command of w.cleanup) assert.ok(out.includes(command));
-		}
-		for (const w of lanes) git(repo, "merge", "-q", "--no-ff", "-m", `merge ${w.branch}`, w.branch);
-		for (const w of lanes) for (const command of w.cleanup) assert.equal(spawnSync("sh", ["-c", command]).status, 0, command);
-		assert.equal(worktreeCount(repo), 1);
-		assert.equal(fs.readdirSync(repo).filter((f) => f.startsWith("touched-")).length, 3);
-	});
-});
-
-test("tasks without isolation keep running in the given checkout and report no lane", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const r = await call({ tasks: [{ agent: "worker", task: "plain", cwd: repo }, { agent: "worker", task: "lane", cwd: repo, isolation: "worktree" }] });
-		assert.equal(r.details.results[0].worktree, undefined);
-		assert.ok(lane(r, 1));
-		assert.match(r.details.results[0].messages[0].content[0].text, new RegExp(`cwd=${repo} task=plain`));
-		assert.equal(worktreeCount(repo), 2);
-	});
-});
-
-test("a cwd that is not a git repository fails the task without spawning", async () => {
-	await withLaneRepo(async ({ e, call, events }) => {
-		const r = await call({ agent: "worker", task: "x", cwd: path.join(e.root, "a"), isolation: "worktree" });
-		assert.equal(r.isError, true);
-		assert.match(text(r), /not inside a git repository/);
-		assert.equal(r.details.results[0].worktree, undefined);
-		assert.equal(events().length, 0);
-	});
-});
-
-test("the parent's uncommitted changes are reported as missing from the lane", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		fs.writeFileSync(path.join(repo, "file.txt"), "uncommitted\n");
-		const r = await call({ agent: "worker", task: "x", cwd: repo, isolation: "worktree" });
-		assert.equal(lane(r).parentDirty, true);
-		assert.match(text(r), /Warning: the parent checkout had uncommitted changes\. The lane started from HEAD and does not contain them\./);
-		assert.equal(fs.readFileSync(path.join(lane(r).path, "file.txt"), "utf8"), "base\n");
-	});
-});
-
-test("setup runs in the lane before the child starts", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const r = await call({ agent: "worker", task: "x", cwd: repo, isolation: "worktree", setup: "echo ready > setup.txt && echo $PWD > where.txt" });
-		const w = lane(r);
-		assert.equal(r.isError, undefined);
-		assert.equal(fs.readFileSync(path.join(w.path, "setup.txt"), "utf8").trim(), "ready");
-		assert.equal(fs.readFileSync(path.join(w.path, "where.txt"), "utf8").trim(), w.path);
-	});
-});
-
-test("a failing setup fails the task, never starts the child, and keeps the lane", async () => {
-	await withLaneRepo(async ({ repo, call, events }) => {
-		const r = await call({ agent: "worker", task: "x", cwd: repo, isolation: "worktree", setup: "echo no network >&2; exit 7" });
-		const w = lane(r);
-		assert.equal(r.isError, true);
-		assert.match(text(r), /Worktree setup failed \(exit 7\)/);
-		assert.match(text(r), /no network/);
-		assert.equal(events().length, 0);
-		assert.ok(fs.existsSync(w.path));
-		assert.deepEqual({ committed: w.committed, dirty: w.dirty, commitsAhead: w.commitsAhead }, { committed: false, dirty: false, commitsAhead: 0 });
-		for (const command of w.cleanup) assert.ok(text(r).includes(command));
-		for (const command of w.cleanup) assert.equal(spawnSync("sh", ["-c", command]).status, 0, command);
-		assert.equal(worktreeCount(repo), 1);
-	});
-});
-
-test("setup without isolation is rejected before anything spawns", async () => {
-	await withLaneRepo(async ({ repo, call, events }) => {
-		for (const params of [{ agent: "worker", task: "x", setup: "true" }, { tasks: [P(1), { agent: "worker", task: "y", setup: "true" }] }]) {
-			const r = await call({ ...params, cwd: repo });
-			assert.equal(r.isError, true);
-			assert.match(text(r), /setup requires isolation/);
-		}
-		assert.equal(events().length, 0);
-		assert.equal(worktreeCount(repo), 1);
-	});
-});
-
-test("a failed child's lane is kept uncommitted for inspection", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const r = await call({ agent: "worker", task: "fail touch", cwd: repo, isolation: "worktree" });
-		const w = lane(r);
-		assert.equal(r.isError, true);
-		assert.deepEqual({ committed: w.committed, dirty: w.dirty, commitsAhead: w.commitsAhead }, { committed: false, dirty: true, commitsAhead: 0 });
-		assert.match(text(r), /uncommitted changes remain/);
-		assert.match(text(r), /git -C .* worktree remove/);
-	});
-});
-
-test("aborting an isolated task stops the child and keeps an uncommitted lane", async () => {
-	await withLaneRepo(async ({ repo, call, events }) => {
-		const controller = new AbortController();
-		const pending = call({ agent: "worker", task: "gate touch", cwd: repo, isolation: "worktree" }, controller.signal);
-		await until(() => events().some((ev) => ev.kind === "S"));
-		controller.abort();
-		const r = await pending;
-		const w = lane(r);
-		assert.equal(r.isError, true);
-		assert.equal(r.details.results[0].status, "aborted");
-		assert.deepEqual({ committed: w.committed, commitsAhead: w.commitsAhead }, { committed: false, commitsAhead: 0 });
-		assert.ok(fs.existsSync(w.path));
-	});
-});
-
-test("a failing commit hook leaves the lane dirty and says why", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const hooks = path.join(repo, ".git", "hooks");
-		fs.mkdirSync(hooks, { recursive: true });
-		fs.writeFileSync(path.join(hooks, "pre-commit"), "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n", { mode: 0o755 });
-		const r = await call({ agent: "worker", task: "touch", cwd: repo, isolation: "worktree" });
-		const w = lane(r);
-		assert.deepEqual({ committed: w.committed, dirty: w.dirty }, { committed: false, dirty: true });
-		assert.match(text(r), /Commit failed; the lane was left dirty:\nhook says no/);
-	});
-});
-
-test("shutdown stops a stalled worktree setup and the task fails with the lane kept", async () => {
-	await withLaneRepo(async ({ repo, call, shutdown, events }) => {
-		const pending = call({ agent: "worker", task: "x", cwd: repo, isolation: "worktree", setup: "sleep 30" });
-		await until(() => worktreeCount(repo) === 2);
-		const started = Date.now();
-		await shutdown();
-		const r = await pending;
-		assert.ok(Date.now() - started < 5000, "shutdown must not wait for setup to finish");
-		assert.equal(r.isError, true);
-		assert.match(text(r), /Worktree setup failed \(aborted\)/);
-		assert.equal(events().length, 0);
-		assert.ok(fs.existsSync(lane(r).path));
-	});
-});
-
-test("a huge commit-hook error line stays within the model-facing output cap", async () => {
-	await withLaneRepo(async ({ repo, call }) => {
-		const hooks = path.join(repo, ".git", "hooks");
-		fs.mkdirSync(hooks, { recursive: true });
-		fs.writeFileSync(path.join(hooks, "pre-commit"), "#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' x >&2\nexit 1\n", { mode: 0o755 });
-		const single = await call({ agent: "worker", task: "touch", cwd: repo, isolation: "worktree" });
-		assert.ok(Buffer.byteLength(text(single)) <= 16 * 1024, `single result was ${Buffer.byteLength(text(single))} bytes`);
-		assert.ok(lane(single).commitError.length < 4096);
-		assert.match(text(single), /cleanup|worktree remove/);
-		const batch = await call({ tasks: [1, 2].map((n) => ({ agent: "worker", task: `touch ${n}`, cwd: repo, isolation: "worktree" })) });
-		assert.ok(Buffer.byteLength(text(batch)) <= 128 * 1024);
-		for (const w of batch.details.results.map((x) => x.worktree)) assert.ok(text(batch).includes(w.cleanup[1]));
-	});
-});
-
-// ---------------------------------------------------------------------------
-// Background jobs
-// ---------------------------------------------------------------------------
-const bg = (task, extra = {}) => ({ agent: "worker", task, background: true, ...extra });
-const jobIdOf = (r) => /Job (job-\d+) started/.exec(text(r))[1];
-
-test("background starts at once and its output arrives once as a follow-up message", async () => {
-	await withExtension(undefined, async ({ call, events, messages, release, callTool }) => {
-		const r = await call(bg("gate one"));
-		const id = jobIdOf(r);
-		assert.match(text(r), /Job job-1 started \(1 task\)/);
-		await until(() => events().some((ev) => ev.kind === "S"));
-		assert.equal(messages.length, 0);
-		assert.match(text(await callTool("subagent_status", {})), /job-1 running: 0\/1 tasks done \[worker: running\]/);
-		release();
-		await until(() => messages.length === 1);
-		await sleep(50);
-		assert.equal(messages.length, 1);
-		const { message, options } = messages[0];
-		assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
-		assert.equal(message.customType, "subagent-job");
-		assert.equal(message.display, true);
-		assert.match(message.content, new RegExp(`^Job ${id} completed\n\nParallel: 1/1 succeeded`));
-		assert.match(message.content, /task=gate one/);
-		// Details stay small: ids and states, never histories.
-		assert.deepEqual(message.details, { jobId: id, status: "completed", tasks: [{ agent: "worker", status: "completed" }] });
-		assert.match(text(await callTool("subagent_status", {})), /job-1 completed: 1\/1 tasks done, output delivered/);
-	});
-});
-
-test("a parallel background job returns every task in one message", async () => {
-	await withExtension(undefined, async ({ call, messages }) => {
-		const r = await call({ tasks: [P(1), P(2), P(3)], background: true });
-		assert.match(text(r), /Job job-1 started \(3 tasks\)/);
-		await until(() => messages.length === 1);
-		assert.match(messages[0].message.content, /Parallel: 3\/3 succeeded/);
-		assert.deepEqual(messages[0].message.details.tasks.map((t) => t.status), ["completed", "completed", "completed"]);
-	});
-});
-
-test("a covering wait takes the output and no follow-up message is sent", async () => {
-	await withExtension(undefined, async ({ call, messages, release, callTool }) => {
-		const id = jobIdOf(await call(bg("gate two")));
-		const waiting = callTool("subagent_wait", { jobIds: [id] });
-		await sleep(50);
-		release();
-		const r = await waiting;
-		assert.match(text(r), new RegExp(`^Job ${id} completed`));
-		assert.match(text(r), /task=gate two/);
-		assert.ok(r.usage);
-		await sleep(50);
-		assert.equal(messages.length, 0);
-		assert.match(text(await callTool("subagent_wait", { jobIds: [id] })), /output was already delivered/);
-		assert.equal(messages.length, 0);
-	});
-});
-
-test("waiting on a job that a message already delivered returns a one-line note", async () => {
-	await withExtension(undefined, async ({ call, messages, callTool }) => {
-		const id = jobIdOf(await call(bg("quick")));
-		await until(() => messages.length === 1);
-		assert.equal(text(await callTool("subagent_wait", { jobIds: [id] })), `Job ${id}: output was already delivered.`);
-	});
-});
-
-test("a wait with a timeout returns what finished; the rest is delivered later, never twice", async () => {
-	await withExtension(undefined, async ({ call, messages, release, callTool }) => {
-		const a = jobIdOf(await call(bg("quick a")));
-		const b = jobIdOf(await call(bg("gate b")));
-		const r = await callTool("subagent_wait", { jobIds: [a, b], timeoutMs: 300 });
-		assert.match(text(r), new RegExp(`Job ${a} completed`));
-		assert.match(text(r), new RegExp(`Job ${b}: still running \\(0/1 tasks done\\)`));
-		assert.equal(messages.length, 0);
-		release();
-		await until(() => messages.length === 1);
-		await sleep(50);
-		assert.equal(messages.length, 1);
-		assert.match(messages[0].message.content, new RegExp(`^Job ${b} completed`));
-	});
-});
-
-test("an aborted wait releases its claim: finished and later results go by message", async () => {
-	await withExtension(undefined, async ({ call, messages, release, callTool }) => {
-		const a = jobIdOf(await call(bg("gate a")));
-		const controller = new AbortController();
-		const waiting = callTool("subagent_wait", { jobIds: [a] }, controller.signal);
-		await sleep(50);
-		controller.abort();
-		assert.equal((await waiting).isError, true);
-		release();
-		await until(() => messages.length === 1);
-		assert.match(messages[0].message.content, new RegExp(`^Job ${a} completed`));
-	});
-});
-
-test("a failed message send leaves the output for subagent_wait", async () => {
-	await withExtension(undefined, async ({ call, messages, runtime, callTool }) => {
-		runtime.failSend = true;
-		const id = jobIdOf(await call(bg("quick")));
-		await sleep(300);
-		assert.equal(messages.length, 0);
-		assert.match(text(await callTool("subagent_status", {})), /output not yet delivered/);
-		assert.match(text(await callTool("subagent_wait", { jobIds: [id] })), /task=quick/);
-	});
-});
-
-test("cancel stops running children, returns partial output and sends no message", async () => {
-	await withExtension(undefined, async ({ call, events, messages, callTool }) => {
-		const id = jobIdOf(await call(bg("gate c")));
-		await until(() => events().some((ev) => ev.kind === "S"));
-		const r = await callTool("subagent_cancel", { jobId: id });
-		assert.match(text(r), new RegExp(`^Job ${id} cancelled`));
-		assert.match(text(r), /### \[worker\] aborted/);
-		assert.ok(events().some((ev) => ev.kind === "T"));
-		await sleep(50);
-		assert.equal(messages.length, 0);
-		assert.match(text(await callTool("subagent_cancel", { jobId: id })), /already delivered/);
-		assert.equal((await callTool("subagent_cancel", { jobId: "job-99" })).isError, true);
-	});
-});
-
-test("shutdown aborts jobs, waits for children and drops deliveries", async () => {
-	await withExtension(undefined, async ({ call, events, messages, shutdown, callTool }) => {
-		await call(bg("gate d"));
-		const id2 = jobIdOf(await call(bg("gate e")));
-		await until(() => events().filter((ev) => ev.kind === "S").length === 2);
-		const waiting = callTool("subagent_wait", { jobIds: [id2] });
-		await shutdown();
-		assert.equal(events().filter((ev) => ev.kind === "T").length, 2);
-		assert.equal((await waiting).isError, true);
-		await sleep(50);
-		assert.equal(messages.length, 0);
-	});
-});
-
-test("background cannot be combined with maxConcurrency and starts nothing", async () => {
-	await withExtension(undefined, async ({ call, events, callTool }) => {
-		const r = await call({ tasks: [P(1), P(2)], background: true, maxConcurrency: 8 });
-		assert.equal(r.isError, true);
-		assert.match(text(r), /maxConcurrency cannot be combined with background/);
-		assert.equal(events().length, 0);
-		assert.equal(text(await callTool("subagent_status", {})), "No background jobs.");
-	});
-});
-
-test("a blocking call behind a background job runs once a slot frees", async () => {
-	await withExtension("1", async ({ call, events, messages, release }) => {
-		await call(bg("gate f"));
-		await until(() => events().some((ev) => ev.kind === "S"));
-		let blocked = true;
-		const blocking = call({ agent: "worker", task: "after" }).then((r) => { blocked = false; return r; });
-		await sleep(150);
-		assert.equal(blocked, true);
-		assert.equal(events().filter((ev) => ev.kind === "S").length, 1);
-		release();
-		assert.match(text(await blocking), /task=after/);
-		await until(() => messages.length === 1);
-	});
-});
-
-test("wait and cancel reject unknown job ids", async () => {
-	await withExtension(undefined, async ({ callTool }) => {
-		const r = await callTool("subagent_wait", { jobIds: ["job-7"] });
-		assert.equal(r.isError, true);
-		assert.match(text(r), /Unknown job: job-7/);
-	});
-});
-
-test("background guidance and the three job tools are registered", async () => {
-	await withExtension(undefined, async ({ ext, tool }) => {
-		for (const name of ["subagent_status", "subagent_wait", "subagent_cancel"]) assert.ok(ext.tools.get(name), name);
-		assert.equal(tool.parameters.properties.background.type, "boolean");
-		const guidance = tool.promptGuidelines.join("\n");
-		assert.match(guidance, /Use background: true only when you have other independent work/);
-		assert.match(guidance, /Do not poll/);
-	});
-});
-
-// ---------------------------------------------------------------------------
-// Child questions (RPC transport, ask_parent)
-// ---------------------------------------------------------------------------
-const asker = (task, extra = {}) => ({ agent: "asker", task, background: true, ...extra });
-const rpcOut = (r) => r.details.results[0]?.messages[0]?.content[0].text;
-
-test("a background task whose agent lists ask_parent runs in RPC mode with the marker environment", async () => {
-	await withExtension(undefined, async ({ call, callTool, messages }) => {
-		const id = jobIdOf(await call(asker("plain")));
-		const out = text(await callTool("subagent_wait", { jobIds: [id] }));
-		assert.match(out, /env=1/);
-		assert.match(out, /args=--mode rpc --no-session --tools read,ask_parent --append-system-prompt /);
-		assert.doesNotMatch(out, / -p /);
-		assert.equal(messages.length, 0);
-	});
-});
-
-test("blocking calls and agents without ask_parent keep the one-way JSON transport", async () => {
-	await withExtension(undefined, async ({ call, callTool }) => {
-		const blocking = await call({ agent: "asker", task: "plain" });
-		assert.match(text(blocking), /args=--mode json -p --no-session/);
-		const id = jobIdOf(await call(bg("plain")));
-		assert.match(text(await callTool("subagent_wait", { jobIds: [id] })), /args=--mode json -p --no-session/);
-	});
-});
-
-test("a question reaches the parent as a follow-up message and subagent_reply answers it", async () => {
-	await withExtension(undefined, async ({ call, callTool, messages, events }) => {
-		const id = jobIdOf(await call(asker("ask now")));
-		await until(() => messages.length === 1);
-		const { message, options } = messages[0];
-		assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
-		assert.equal(message.customType, "subagent-question");
-		assert.match(message.content, new RegExp(`Question q-1 from asker \\(task 1 of ${id}\\): which database\\?`));
-		assert.match(message.content, /subagent_reply\(\{ jobId: "job-1", requestId: "q-1", answer \}\)/);
-		assert.deepEqual(message.details, { jobId: id, requestId: "q-1", agent: "asker" });
-		assert.match(text(await callTool("subagent_status", {})), /open question q-1 from asker: which database\?/);
-
-		const reply = await callTool("subagent_reply", { jobId: id, requestId: "q-1", answer: "postgres" });
-		assert.equal(reply.isError, undefined);
-		await until(() => messages.length === 2);
-		assert.match(messages[1].message.content, /answer=postgres/);
-		assert.ok(events().some((ev) => ev.kind === "R"));
-		// The question is gone once answered.
-		assert.equal((await callTool("subagent_reply", { jobId: id, requestId: "q-1", answer: "again" })).isError, true);
-	});
-});
-
-test("a question wakes a blocked subagent_wait instead of waiting behind a queued message", async () => {
-	await withExtension(undefined, async ({ call, callTool, messages }) => {
-		const id = jobIdOf(await call(asker("ask now")));
-		const r = await callTool("subagent_wait", { jobIds: [id] });
-		assert.match(text(r), new RegExp(`Job ${id}: still running`));
-		assert.match(text(r), /Question q-1 from asker/);
-		assert.equal(messages.length, 0, "announced once, by the wait");
-		await callTool("subagent_reply", { jobId: id, requestId: "q-1", answer: "sqlite" });
-		const done = await callTool("subagent_wait", { jobIds: [id] });
-		assert.match(text(done), /answer=sqlite/);
-		assert.equal(messages.length, 0);
-	});
-});
-
-test("an unanswered question expires, the child continues, and a late reply is refused", async () => {
-	process.env.PI_SUBAGENT_ASK_TIMEOUT_MS = "150";
-	await withExtension(undefined, async ({ call, callTool, messages }) => {
-		const id = jobIdOf(await call(asker("ask now")));
-		await until(() => messages.length >= 1);
-		await until(() => messages.some((m) => m.message.customType === "subagent-job"));
-		const job = messages.find((m) => m.message.customType === "subagent-job").message;
-		assert.match(job.content, /answer=none/);
-		const late = await callTool("subagent_reply", { jobId: id, requestId: "q-1", answer: "too late" });
-		assert.equal(late.isError, true);
-		assert.match(text(late), /unknown or expired/);
-	});
-});
-
-test("dialogs from other extensions are declined at once and notifications are ignored", async () => {
-	await withExtension(undefined, async ({ call, callTool, messages }) => {
-		const id = jobIdOf(await call(asker("foreign notify")));
-		const out = text(await callTool("subagent_wait", { jobIds: [id] }));
-		assert.match(out, /foreign=\{"type":"extension_ui_response","id":"ui-1","cancelled":true\}/);
-		assert.equal(messages.length, 0);
-	});
-});
-
-test("a rejected prompt ends the child and fails the task", async () => {
-	await withExtension(undefined, async ({ call, callTool, events }) => {
-		const id = jobIdOf(await call(asker("reject")));
-		const out = text(await callTool("subagent_wait", { jobIds: [id] }));
-		assert.match(out, /### \[asker\] failed/);
-		assert.match(out, /Prompt rejected: no model/);
-		assert.ok(events().some((ev) => ev.kind === "E"), "stdin was closed so the child exited");
-	});
-});
-
-test("a handled prompt closes stdin without waiting for agent_settled", async () => {
-	await withExtension(undefined, async ({ call, callTool, events }) => {
-		const id = jobIdOf(await call(asker("handled")));
-		const out = text(await callTool("subagent_wait", { jobIds: [id], timeoutMs: 5000 }));
-		assert.match(out, new RegExp(`^Job ${id} completed`));
-		assert.ok(events().some((ev) => ev.kind === "E"));
-	});
-});
-
-test("cancelling a job with an open question terminates the child and forgets the question", async () => {
-	process.env.PI_SUBAGENT_ASK_TIMEOUT_MS = "60000";
-	await withExtension(undefined, async ({ call, callTool, messages, events }) => {
-		const id = jobIdOf(await call(asker("ask now")));
-		await until(() => messages.length === 1);
-		await callTool("subagent_cancel", { jobId: id });
-		assert.ok(events().some((ev) => ev.kind === "T"));
-		assert.equal((await callTool("subagent_reply", { jobId: id, requestId: "q-1", answer: "x" })).isError, true);
-	});
-});
-
-test("ask_parent says there is no parent outside an RPC background child", async () => {
-	await withExtension(undefined, async ({ ext }) => {
-		const tool = ext.tools.get("ask_parent").definition;
-		assert.equal(tool.defaultActive, false);
-		const r = await tool.execute("id", { question: "which?" }, undefined, undefined, { mode: "tui", ui: { input: () => assert.fail("must not prompt") } });
-		assert.match(r.content[0].text, /No parent can answer in this run/);
-	});
-});
-
-test("ask_parent asks through a tagged dialog with the timeout and returns the answer", async () => {
-	process.env.PI_SUBAGENT_ASK_PARENT = "1";
-	process.env.PI_SUBAGENT_ASK_TIMEOUT_MS = "4000";
+	let pids = [];
 	try {
-		await withExtension(undefined, async ({ ext }) => {
-			const tool = ext.tools.get("ask_parent").definition;
-			let seen;
-			const ctx = { mode: "rpc", ui: { input: async (title, placeholder, options) => { seen = { title, placeholder, timeout: options.timeout }; return "use sqlite"; } } };
-			assert.equal((await tool.execute("id", { question: "which?" }, undefined, undefined, ctx)).content[0].text, "use sqlite");
-			assert.deepEqual(seen, { title: "ask_parent: which?", placeholder: undefined, timeout: 4000 });
-			const none = await tool.execute("id", { question: "which?" }, undefined, undefined, { mode: "rpc", ui: { input: async () => undefined } });
-			assert.match(none.content[0].text, /No answer arrived\. State the assumption/);
-		});
-	} finally {
-		delete process.env.PI_SUBAGENT_ASK_PARENT;
-	}
-});
-
-test("a wait that overlaps a cancel is woken and leaves the output to the cancel", async () => {
-	await withExtension(undefined, async ({ call, events, callTool }) => {
-		const id = jobIdOf(await call(bg("gate g")));
-		await until(() => events().some((ev) => ev.kind === "S"));
-		const waiting = callTool("subagent_wait", { jobIds: [id] });
-		await sleep(50);
-		const cancelled = await callTool("subagent_cancel", { jobId: id });
-		const waited = await Promise.race([waiting, sleep(3000).then(() => "hung")]);
-		assert.notEqual(waited, "hung", "wait must not block forever after a cancel");
-		assert.match(text(waited), /being cancelled; subagent_cancel returns its output/);
-		assert.match(text(cancelled), new RegExp(`^Job ${id} cancelled`));
-		assert.match(text(cancelled), /### \[worker\] aborted/);
-	});
-});
-
-test("a question already queued as a follow-up still wakes a wait that starts afterwards", async () => {
-	await withExtension(undefined, async ({ call, callTool, messages }) => {
-		const id = jobIdOf(await call(asker("ask now")));
-		await until(() => messages.length === 1);
-		const r = await Promise.race([callTool("subagent_wait", { jobIds: [id] }), sleep(3000).then(() => "hung")]);
-		assert.notEqual(r, "hung", "the queued message may not be seen until the wait ends");
-		assert.match(text(r), /Question q-1 from asker/);
-		// Shown once: a second wait does not wake for it again.
-		const again = await Promise.race([callTool("subagent_wait", { jobIds: [id], timeoutMs: 200 }), sleep(3000).then(() => "hung")]);
-		assert.match(text(again), /still running/);
-		assert.doesNotMatch(text(again), /Question q-1/);
-	});
-});
-
-test("shutdown stops a stalled commit hook, waits for it to exit and commits nothing", async () => {
-	await withLaneRepo(async ({ e, repo, call, shutdown }) => {
-		const hooks = path.join(repo, ".git", "hooks");
-		const pidFile = path.join(e.root, "hook.pid");
-		fs.mkdirSync(hooks, { recursive: true });
-		fs.writeFileSync(path.join(hooks, "pre-commit"), `#!/bin/sh\necho $$ > ${pidFile}\nsleep 30\n`, { mode: 0o755 });
-		const pending = call({ agent: "worker", task: "touch", cwd: repo, isolation: "worktree" });
-		await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim());
-		const pid = Number(fs.readFileSync(pidFile, "utf8"));
+		await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").split(" ").length === 2);
+		pids = fs.readFileSync(pidFile, "utf8").split(" ").map(Number);
+		await sleep(300); // let the grandchild install its SIGTERM handler
+		assert.ok(pids.every(pidAlive));
 		const started = Date.now();
-		await shutdown();
-		assert.ok(Date.now() - started < 8000, "shutdown must not wait for the hook to finish");
-		assert.equal(pidAlive(pid), false, "the hook process group is gone when shutdown returns");
-		const r = await pending;
-		assert.equal(lane(r).committed, false);
-		assert.equal(lane(r).commitsAhead, 0);
-	});
+		controller.abort();
+		assert.equal((await run).status, "aborted");
+		assert.ok(Date.now() - started >= 250, "the TERM-ignoring tree survives until the grace period ends");
+		await until(() => pids.every((pid) => !pidAlive(pid)), 2000);
+	} finally {
+		for (const pid of pids) try { process.kill(pid, "SIGKILL"); } catch {}
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });

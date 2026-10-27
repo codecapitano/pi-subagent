@@ -1,29 +1,12 @@
-export const DEFAULT_CONCURRENCY = 6;
-export const DEFAULT_CEILING = 8;
+export const DEFAULT_CONCURRENCY = 4;
 export const MAX_CONCURRENCY = 16;
 export const CONCURRENCY_ENV = "PI_SUBAGENT_MAX_CONCURRENCY";
-export const CEILING_ENV = "PI_SUBAGENT_CONCURRENCY_CEILING";
 
-function parseLimit(env, name) {
-	const raw = env?.[name];
-	if (raw === undefined || raw === "") return undefined;
-	if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > MAX_CONCURRENCY) {
-		throw new Error(`Invalid ${name}=${JSON.stringify(raw)}: expected an integer from 1 to ${MAX_CONCURRENCY}.`);
-	}
-	return Number(raw);
-}
-
-/**
- * Returns the base child limit and the ceiling a single call may raise it to.
- * Throws a clear error for invalid settings. An unset ceiling never sits below the base.
- */
+/** Child limit from the environment: unset or non-numeric gives the default; numbers clamp to 1..16. */
 export function parseConcurrency(env) {
-	const base = parseLimit(env, CONCURRENCY_ENV) ?? DEFAULT_CONCURRENCY;
-	const ceiling = parseLimit(env, CEILING_ENV) ?? Math.max(base, DEFAULT_CEILING);
-	if (ceiling < base) {
-		throw new Error(`Invalid ${CEILING_ENV}=${ceiling}: must not be below ${CONCURRENCY_ENV}=${base}.`);
-	}
-	return { base, ceiling };
+	const raw = env?.[CONCURRENCY_ENV];
+	const value = Number.parseInt(raw ?? "", 10);
+	return Number.isFinite(value) ? Math.min(MAX_CONCURRENCY, Math.max(1, value)) : DEFAULT_CONCURRENCY;
 }
 export const KILL_GRACE_MS = 5000;
 
@@ -33,17 +16,16 @@ export const KILL_GRACE_MS = 5000;
  * A slot is acquired before `prepare()`/spawn and released exactly once, only after the
  * child has closed (or was never started). Aborts never spawn queued work; running
  * children get SIGTERM, then SIGKILL after `killGraceMs`, and keep their slot until close.
- *
- * `prepare()` may also return `stdin: true` (pipe stdin instead of ignoring it) and `env` (merged over
- * the parent's environment). `onSpawn(proc)` then lets the caller write to the child.
+ * A prepared command with `detached: true` leads its own process group and the signals go
+ * to the whole group, so grandchildren cannot outlive a cancelled child.
  *
  * `run()` never rejects. Its result is `{ status, exitCode, signal, error, spawned }`
  * where status is "completed" | "failed" | "aborted".
  */
 export function createChildRunner({
 	capacity = DEFAULT_CONCURRENCY,
-	ceiling = capacity,
 	spawn,
+	kill = process.kill.bind(process),
 	setTimeout: setTimer = globalThis.setTimeout,
 	clearTimeout: clearTimer = globalThis.clearTimeout,
 	killGraceMs = KILL_GRACE_MS,
@@ -52,10 +34,6 @@ export function createChildRunner({
 	let closed = false;
 	let shutdownPromise;
 	const queue = [];
-	// Per-call raises above `capacity`, each bounded by `ceiling` and removed when its call ends.
-	// Objects, not numbers, so two raises to the same value release independently.
-	const raises = new Set();
-	const effective = () => Math.max(capacity, ...[...raises].map((r) => r.value));
 	const entries = new Set();
 	const tracked = new Set();
 	const abortGroups = new Map();
@@ -81,7 +59,7 @@ export function createChildRunner({
 	};
 
 	const drain = () => {
-		while (queue.length > 0 && active < effective()) {
+		while (queue.length > 0 && active < capacity) {
 			const waiter = queue.shift();
 			active++;
 			waiter.grant(makeRelease());
@@ -98,7 +76,7 @@ export function createChildRunner({
 	};
 	// Resolves to a release function, or null when `entry` was aborted while queued.
 	const acquire = (entry) => {
-		if (active < effective() && queue.length === 0) {
+		if (active < capacity && queue.length === 0) {
 			active++;
 			return Promise.resolve(makeRelease());
 		}
@@ -115,7 +93,7 @@ export function createChildRunner({
 	};
 
 	async function execute(spec) {
-		const { signal, prepare, cleanup, onState, onStdout, onStderr, onSpawn } = spec;
+		const { signal, prepare, cleanup, onState, onStdout, onStderr } = spec;
 		const emit = (state) => {
 			try {
 				onState?.(state);
@@ -168,20 +146,14 @@ export function createChildRunner({
 				proc = spawn(command.command, command.args, {
 					cwd: command.cwd,
 					shell: false,
-					stdio: [command.stdin ? "pipe" : "ignore", "pipe", "pipe"],
-					...(command.env ? { env: { ...process.env, ...command.env } } : {}),
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: command.detached === true,
+					env: command.env,
 				});
 			} catch (error) {
 				return failed(error);
 			}
-			// A child that exits early closes its stdin; the resulting EPIPE must not crash the parent.
-			proc.stdin?.on("error", () => {});
 			emit("running");
-			try {
-				onSpawn?.(proc);
-			} catch {
-				/* observers must not break scheduling */
-			}
 
 			return await new Promise((resolve) => {
 				let settled = false;
@@ -189,11 +161,20 @@ export function createChildRunner({
 				let timer = null;
 				let spawnError;
 
+				const detached = command.detached === true;
 				const safeKill = (sig) => {
+					try {
+						if (detached && proc.pid !== undefined) kill(-proc.pid, sig);
+						else proc.kill(sig);
+						return;
+					} catch {
+						/* group or process may already be gone */
+					}
+					if (!detached) return;
 					try {
 						proc.kill(sig);
 					} catch {
-						/* process may already be gone */
+						/* already gone */
 					}
 				};
 				const terminate = () => {
@@ -202,7 +183,8 @@ export function createChildRunner({
 					safeKill("SIGTERM");
 					timer = setTimer(() => {
 						timer = null;
-						if (!settled && proc.exitCode === null && proc.signalCode === null) safeKill("SIGKILL");
+						// A detached group may outlive its leader while holding the pipes open.
+						if (!settled && (detached || (proc.exitCode === null && proc.signalCode === null))) safeKill("SIGKILL");
 					}, killGraceMs);
 				};
 				const finish = (code, sig) => {
@@ -267,21 +249,6 @@ export function createChildRunner({
 			return promise;
 		},
 		stats: () => ({ active, queued: queue.length }),
-		/**
-		 * Raises the active limit to `limit` (clamped to the ceiling) until the returned
-		 * function is called. Never lowers it: running children keep their slots and other
-		 * overlapping calls are unaffected. The release function is idempotent.
-		 */
-		raise(limit) {
-			const value = Math.min(ceiling, Math.floor(limit));
-			if (!(value > capacity)) return () => {};
-			const raise = { value };
-			raises.add(raise);
-			drain();
-			return () => {
-				raises.delete(raise);
-			};
-		},
 		/** Aborts queued and running work; resolves after every child has terminated. */
 		shutdown() {
 			if (!shutdownPromise) {

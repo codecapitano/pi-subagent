@@ -11,7 +11,7 @@ const agentFiles = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
 test("starter agents are present", () => {
 	assert.deepEqual(
 		agentFiles.sort(),
-		["advisor.md", "explorer.md", "implementer.md", "reviewer.md", "scout.md", "verifier.md"],
+		["advisor.md", "explorer.md", "implementer.md"],
 	);
 });
 
@@ -30,11 +30,13 @@ for (const file of agentFiles) {
 	});
 }
 
-test("implementer can consult without general delegation and advisor stays read-only", () => {
+test("implementer delegates read-only and advisor can run read-only bash", () => {
 	const implementer = fs.readFileSync(path.join(agentsDir, "implementer.md"), "utf8");
-	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, consult_advisor, ask_parent\]$/m);
+	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, subagent\]$/m);
 	const advisor = fs.readFileSync(path.join(agentsDir, "advisor.md"), "utf8");
-	assert.match(advisor, /^tools: \[read, grep, find, ls\]$/m);
+	assert.match(advisor, /^tools: \[read, grep, find, ls, bash\]$/m);
+	const explorer = fs.readFileSync(path.join(agentsDir, "explorer.md"), "utf8");
+	assert.match(explorer, /^tools: \[read, grep, find, ls, web_search, web_fetch\]$/m);
 });
 
 // Everything published must be free of machine-specific or private details.
@@ -71,7 +73,7 @@ test("no published file contains machine-specific or private details", () => {
 test("optional agents are valid and do not pin a model", () => {
 	const dir = path.join(agentsDir, "optional");
 	const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-	assert.deepEqual(files, ["design-reviewer.md"]);
+	assert.deepEqual(files, ["design-reviewer.md", "reviewer.md", "scout.md", "verifier.md"]);
 	for (const file of files) {
 		const match = /^---\n([\s\S]*?)\n---\n([\s\S]+)$/.exec(fs.readFileSync(path.join(dir, file), "utf8"));
 		assert.ok(match, `${file} frontmatter`);
