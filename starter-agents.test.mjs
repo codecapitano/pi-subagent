@@ -32,7 +32,7 @@ for (const file of agentFiles) {
 
 test("implementer can consult without general delegation and advisor stays read-only", () => {
 	const implementer = fs.readFileSync(path.join(agentsDir, "implementer.md"), "utf8");
-	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, consult_advisor\]$/m);
+	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, consult_advisor, ask_parent\]$/m);
 	const advisor = fs.readFileSync(path.join(agentsDir, "advisor.md"), "utf8");
 	assert.match(advisor, /^tools: \[read, grep, find, ls\]$/m);
 });

@@ -7,11 +7,14 @@
  * Local policy supports two modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
+ * Either can run in its own git worktree (`isolation`) or as a background job (`background`),
+ * which also lets a child ask the parent a question (`ask_parent`).
  *
  * Chain and project-agent execution from the upstream example are retained only
  * for compatibility with stored calls and rejected before execution.
  *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses JSON mode to capture structured output from subagents. Background tasks of agents that
+ * list `ask_parent` use RPC mode instead, so the child can ask the parent a question.
  */
 
 import { spawn } from "node:child_process";
@@ -31,11 +34,17 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, describeAgents, discoverAgents } from "./agents.ts";
 import { createChildRunner, parseConcurrency } from "./lifecycle.mjs";
+import { createLane, describeLaneState, finishLane, formatLane, runSetup } from "./worktree.mjs";
 import { createHistory, createLineReader, createStderrBuffer, createUsageTotals, joinTextParts, truncateUtf8, BATCH_OUTPUT_BYTES, FINAL_BYTES } from "./output.mjs";
 
 const MAX_PARALLEL_TASKS = 32;
 const COLLAPSED_ITEM_COUNT = 10;
 const MODEL_VISIBLE_OUTPUT_CAP = 16 * 1024;
+/** Dialog title prefix that marks a child's `ask_parent` question; any other dialog is declined. */
+const ASK_PREFIX = "ask_parent: ";
+const ASK_TIMEOUT_ENV = "PI_SUBAGENT_ASK_TIMEOUT_MS";
+const ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const QUESTION_BYTES = 4096;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -148,6 +157,55 @@ interface UsageStats {
 	turns: number;
 }
 
+/** Final state of an isolated lane; see `finishLane` in worktree.mjs. */
+interface WorktreeInfo {
+	path: string;
+	branch: string;
+	base: string;
+	commitsAhead: number;
+	/** The extension committed the lane's changes after the child finished. */
+	committed: boolean;
+	dirty: boolean;
+	/** The parent checkout had uncommitted changes the lane does not contain. */
+	parentDirty: boolean;
+	commitError?: string;
+	/** Exact commands that remove the lane and its branch once merged. */
+	cleanup: string[];
+}
+
+interface Job {
+	id: string;
+	status: "running" | "completed" | "cancelled";
+	results: SingleResult[];
+	/** Set once delivered, when the heavy results are dropped. */
+	taskStates?: { agent: string; status: TaskStatus }[];
+	controller: AbortController;
+	done: Promise<void>;
+	delivered: boolean;
+	/** The caller (subagent_cancel) will take the output, so completion must not deliver it. */
+	holding: boolean;
+	/** Open questions from this job's children, by the id the parent answers with. */
+	questions: Map<string, Question>;
+}
+
+interface Question {
+	id: string;
+	jobId: string;
+	taskIndex: number;
+	agent: string;
+	text: string;
+	/** A subagent_wait result has shown it. A queued follow-up does not count: it may sit behind the current turn. */
+	shown: boolean;
+	respond: (answer: string | undefined) => void;
+	timer?: ReturnType<typeof setTimeout>;
+}
+
+interface Wait {
+	ids: Set<string>;
+	check: () => void;
+	finish: (reason: "done" | "timeout" | "abort" | "question") => void;
+}
+
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "aborted";
 
 interface SingleResult {
@@ -169,6 +227,7 @@ interface SingleResult {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	worktree?: WorktreeInfo;
 }
 
 interface SubagentDetails {
@@ -301,6 +360,29 @@ type ChildRunner = ReturnType<typeof createChildRunner>;
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+/** A child's question, as seen by the parent. `respond(undefined)` cancels it. */
+interface RpcQuestion {
+	requestId: string;
+	question: string;
+	timeoutMs?: number;
+	respond: (answer: string | undefined) => void;
+}
+
+/** Background tasks whose agent lists `ask_parent` run in RPC mode and report through these hooks. */
+interface RpcHooks {
+	askTimeoutMs: number;
+	onQuestion: (question: RpcQuestion) => void;
+	onClose: () => void;
+}
+
+interface LaneRequest {
+	setup?: string;
+	/** Aborts setup and finalization when the extension shuts down, so they cannot block reload or quit. */
+	shutdown?: AbortSignal;
+	/** Registers finalization so shutdown can wait for its git processes. */
+	track?: (done: Promise<unknown>) => void;
+}
+
 interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
@@ -317,7 +399,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	consultation = false,
+	{ consultation = false, lane, rpc }: { consultation?: boolean; lane?: LaneRequest; rpc?: RpcHooks } = {},
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -337,7 +419,9 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	// RPC lets the child ask the parent; it is used only for agents that can call ask_parent.
+	const useRpc = Boolean(rpc) && !consultation && agent.tools.includes("ask_parent");
+	const args: string[] = useRpc ? ["--mode", "rpc", "--no-session"] : ["--mode", "json", "-p", "--no-session"];
 	const inheritsDispatchConfig = !agent.model;
 	const model = agent.model ?? dispatchDefaults.model;
 	if (model) args.push("--model", model);
@@ -385,6 +469,48 @@ async function runSingleAgent(
 		}
 	};
 
+	let input: NodeJS.WritableStream | undefined;
+	const send = (record: object) => {
+		try {
+			input?.write(`${JSON.stringify(record)}\n`);
+		} catch {
+			/* the child is gone */
+		}
+	};
+	// Closing stdin is how an RPC child is asked to exit once its run has settled.
+	const endInput = () => {
+		try {
+			input?.end();
+		} catch {
+			/* already closed */
+		}
+	};
+	const handleRpcRecord = (event: any) => {
+		if (event.type === "response" && event.command === "prompt") {
+			if (event.success === false) {
+				currentResult.stopReason = "error";
+				currentResult.errorMessage = truncateUtf8(`Prompt rejected: ${event.error ?? "unknown error"}`, FINAL_BYTES);
+				endInput();
+			} else if (event.data?.disposition === "handled") endInput(); // no run started, so no agent_settled will follow
+		} else if (event.type === "agent_settled") {
+			endInput();
+		} else if (event.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(event.method)) {
+			const title = typeof event.title === "string" ? event.title : "";
+			if (event.method === "input" && title.startsWith(ASK_PREFIX) && rpc) {
+				const requestId = String(event.id);
+				rpc.onQuestion({
+					requestId,
+					question: truncateUtf8(title.slice(ASK_PREFIX.length), QUESTION_BYTES, "..."),
+					timeoutMs: typeof event.timeout === "number" ? event.timeout : undefined,
+					respond: (answer) => send({ type: "extension_ui_response", id: requestId, ...(answer === undefined ? { cancelled: true } : { value: answer }) }),
+				});
+			} else {
+				// Other extensions in the child now see a UI; nobody is there to answer them.
+				send({ type: "extension_ui_response", id: event.id, cancelled: true });
+			}
+		}
+	};
+
 	const processLine = (line: string) => {
 		if (!line.trim()) return;
 		let event: any;
@@ -393,6 +519,8 @@ async function runSingleAgent(
 		} catch {
 			return;
 		}
+
+		if (useRpc) handleRpcRecord(event);
 
 		if (event.type === "message_end" && event.message) {
 			const msg = event.message as Message;
@@ -430,10 +558,20 @@ async function runSingleAgent(
 	};
 
 	const lines = createLineReader(processLine);
+	let createdLane: Awaited<ReturnType<typeof createLane>> | undefined;
+	let promptMessage = "";
 	const outcome = await runner.run({
 		signal,
 		// Runs after a child slot is acquired, so queued tasks create no temp files.
 		prepare: async () => {
+			let childCwd = cwd ?? defaultCwd;
+			let childTask = task;
+			if (lane) {
+				createdLane = await createLane({ cwd: childCwd, agent: agent.name });
+				if (lane.setup) await runSetup(createdLane, lane.setup, AbortSignal.any([signal, lane.shutdown].filter((s): s is AbortSignal => !!s)));
+				childCwd = createdLane.cwd;
+				childTask = `${task}\n\nYou are in an isolated worktree on branch ${createdLane.branch}; edit only here.`;
+			}
 			const spawnArgs = [...args];
 			if (agent.systemPrompt.trim()) {
 				const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
@@ -441,9 +579,15 @@ async function runSingleAgent(
 				tmpPromptPath = tmp.filePath;
 				spawnArgs.push("--append-system-prompt", tmpPromptPath);
 			}
-			spawnArgs.push(`Task: ${task}`);
+			promptMessage = `Task: ${childTask}`;
+			if (!useRpc) spawnArgs.push(promptMessage);
 			const invocation = getPiInvocation(spawnArgs);
-			return { command: invocation.command, args: invocation.args, cwd: cwd ?? defaultCwd };
+			return {
+				command: invocation.command,
+				args: invocation.args,
+				cwd: childCwd,
+				...(useRpc ? { stdin: true, env: { PI_SUBAGENT_ASK_PARENT: "1", [ASK_TIMEOUT_ENV]: String(rpc!.askTimeoutMs) } } : {}),
+			};
 		},
 		cleanup: () => {
 			if (tmpPromptPath)
@@ -463,12 +607,18 @@ async function runSingleAgent(
 			currentResult.status = state;
 			emitUpdate();
 		},
+		onSpawn: (proc: { stdin?: NodeJS.WritableStream | null }) => {
+			if (!useRpc || !proc.stdin) return;
+			input = proc.stdin;
+			send({ id: "prompt", type: "prompt", message: promptMessage });
+		},
 		onStdout: (data: Buffer) => lines.write(data),
 		onStderr: (data: Buffer) => stderr.write(data),
 	});
 
 	lines.end();
 	stderr.end();
+	if (useRpc) rpc!.onClose();
 	updateOutput();
 
 	currentResult.exitCode = outcome.exitCode ?? 1;
@@ -492,13 +642,62 @@ async function runSingleAgent(
 	} else {
 		currentResult.status = "completed";
 	}
+	if (createdLane) {
+		// Only a completed child's work is committed; failed or aborted lanes stay as they are for inspection.
+		const finishing = finishLane(createdLane, { agent: agent.name, task, commit: currentResult.status === "completed", signal: lane?.shutdown });
+		lane?.track?.(finishing);
+		currentResult.worktree = await finishing;
+	}
 	return currentResult;
 }
+
+/** Model-facing text for a finished batch: bounded per task and in total, with lane headers. */
+function formatBatch(results: SingleResult[], limitNote = ""): string {
+	const successCount = results.filter((r) => !isFailedResult(r)).length;
+	const headers = results.map((r) => {
+		const status =
+			getStatus(r) === "aborted"
+				? "aborted"
+				: isFailedResult(r)
+					? `failed${getFailureReason(r) ? ` (${getFailureReason(r)})` : ""}`
+					: "completed";
+		return `### [${truncateUtf8(r.agent, 128, "...")}] ${status}\n\n${r.worktree ? `${formatLane(r.worktree)}\n\n` : ""}`;
+	});
+	const prefix = `${limitNote}Parallel: ${successCount}/${results.length} succeeded\n\n`;
+	const separator = "\n\n---\n\n";
+	const overhead = Buffer.byteLength(prefix + headers.join(separator));
+	const outputs = results.map(getResultOutput);
+	const demands = outputs.map((text, index) => ({ index, bytes: Math.min(MODEL_VISIBLE_OUTPUT_CAP, Buffer.byteLength(text)) }))
+		.sort((a, b) => a.bytes - b.bytes);
+	const budgets = new Array<number>(results.length);
+	let remaining = BATCH_OUTPUT_BYTES - overhead;
+	for (let i = 0; i < demands.length; i++) {
+		const { index, bytes } = demands[i];
+		budgets[index] = Math.min(bytes, Math.floor(remaining / (demands.length - i)));
+		remaining -= budgets[index];
+	}
+	return prefix + results.map((_r, i) => headers[i] + truncateModelVisibleOutput(outputs[i], budgets[i])).join(separator);
+}
+
+interface TaskInput {
+	agent: string;
+	task: string;
+	cwd?: string;
+	isolation?: "worktree";
+	setup?: string;
+}
+
+const ISOLATION_DESCRIPTION =
+	"\"worktree\" runs the task in its own git worktree and branch, created from HEAD. The parent merges the branch and removes the lane afterwards.";
+const SETUP_DESCRIPTION =
+	"Shell command run in the new worktree before the task, for example to install dependencies. Requires isolation. It should leave tracked files unchanged.";
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	isolation: Type.Optional(StringEnum(["worktree"] as const, { description: ISOLATION_DESCRIPTION })),
+	setup: Type.Optional(Type.String({ description: SETUP_DESCRIPTION })),
 });
 
 const SubagentParams = Type.Object({
@@ -513,6 +712,13 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	background: Type.Optional(
+		Type.Boolean({
+			description: "Start the work and return a job id at once. The result arrives later as a follow-up message, or from subagent_wait. Cannot be combined with maxConcurrency.",
+		}),
+	),
+	isolation: Type.Optional(StringEnum(["worktree"] as const, { description: `${ISOLATION_DESCRIPTION} (single mode)` })),
+	setup: Type.Optional(Type.String({ description: `${SETUP_DESCRIPTION} (single mode)` })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -527,9 +733,128 @@ export default function (pi: ExtensionAPI) {
 	// One runner per extension runtime: single and parallel calls share its FIFO limiter.
 	const runner: ChildRunner = createChildRunner({ capacity: limits.base, ceiling: limits.ceiling, spawn });
 
+	// Worktree setup commands run before a child exists, so the runner cannot stop them.
+	const shutdownController = new AbortController();
+	const finalizing = new Set<Promise<unknown>>();
+	const trackFinalization = (done: Promise<unknown>) => {
+		finalizing.add(done);
+		void done.then(() => finalizing.delete(done), () => finalizing.delete(done));
+	};
+
+	// Background jobs live only in this runtime; a reload or quit stops them.
+	const jobs = new Map<string, Job>();
+	const waits = new Set<Wait>();
+	let jobCounter = 0;
+	// After shutdown the captured `pi` is stale, so nothing is delivered any more.
+	let closed = false;
+
+	const taskStates = (job: Job) => job.taskStates ?? job.results.map((r) => ({ agent: r.agent, status: getStatus(r) }));
+	const jobText = (job: Job) => `Job ${job.id} ${job.status}\n\n${formatBatch(job.results)}`;
+	// Delivered jobs keep only their task states, so finished work does not hold full histories.
+	const markDelivered = (job: Job) => {
+		job.taskStates = taskStates(job);
+		job.results = [];
+		job.delivered = true;
+	};
+	const consume = (job: Job, taken: SingleResult[]) => {
+		taken.push(...job.results);
+		const text = jobText(job);
+		markDelivered(job);
+		return text;
+	};
+	// A queued follow-up cannot be recalled, so each job is delivered exactly once, here or to a wait.
+	const followUp = (customType: string, content: string, details: object): boolean => {
+		if (closed) return false;
+		try {
+			const sent: unknown = pi.sendMessage({ customType, content, display: true, details }, { triggerTurn: true, deliverAs: "followUp" });
+			void Promise.resolve(sent).catch(() => {});
+			return true;
+		} catch {
+			return false; // the output stays undelivered, so a later subagent_wait can still fetch it
+		}
+	};
+	const deliver = (job: Job) => {
+		if (job.delivered) return;
+		if (followUp("subagent-job", jobText(job), { jobId: job.id, status: job.status, tasks: taskStates(job) })) markDelivered(job);
+	};
+
+	// Questions from background children. Unanswered, the child's own timeout fires and it continues.
+	const askTimeoutMs = Number(process.env[ASK_TIMEOUT_ENV]) > 0 ? Number(process.env[ASK_TIMEOUT_ENV]) : ASK_TIMEOUT_MS;
+	let questionCounter = 0;
+	const questionText = (q: Question, minutes: number) =>
+		`Question ${q.id} from ${q.agent} (task ${q.taskIndex + 1} of ${q.jobId}): ${q.text}\n` +
+		`Answer with subagent_reply({ jobId: "${q.jobId}", requestId: "${q.id}", answer }). ` +
+		`Unanswered, it expires in ${minutes} min and the child continues on its own assumption.`;
+	const pendingQuestions = (job: Job) => [...job.questions.values()].filter((q) => !q.shown);
+	const closeQuestions = (job: Job, taskIndex: number) => {
+		for (const q of [...job.questions.values()]) {
+			if (q.taskIndex !== taskIndex) continue;
+			clearTimeout(q.timer);
+			job.questions.delete(q.id);
+		}
+	};
+	const rpcHooks = (job: Job, taskIndex: number): RpcHooks => ({
+		askTimeoutMs,
+		onClose: () => closeQuestions(job, taskIndex),
+		onQuestion: (asked) => {
+			if (closed) return asked.respond(undefined);
+			const q: Question = {
+				id: `q-${++questionCounter}`,
+				jobId: job.id,
+				taskIndex,
+				agent: job.results[taskIndex]?.agent ?? "agent",
+				text: asked.question,
+				shown: false,
+				respond: asked.respond,
+			};
+			// The child resolves its own dialog at the same timeout; this only forgets the request.
+			const ms = asked.timeoutMs ?? askTimeoutMs;
+			q.timer = setTimeout(() => job.questions.delete(q.id), ms);
+			q.timer.unref?.();
+			job.questions.set(q.id, q);
+			const covering = [...waits].filter((w) => w.ids.has(job.id));
+			if (covering.length) for (const w of covering) w.check();
+			else followUp("subagent-question", questionText(q, Math.max(1, Math.round(ms / 60000))), { jobId: job.id, requestId: q.id, agent: q.agent });
+		},
+	});
+	const settle = (job: Job) => {
+		job.status = job.controller.signal.aborted ? "cancelled" : "completed";
+		if (closed) return;
+		const covering = [...waits].filter((w) => w.ids.has(job.id));
+		for (const w of covering) w.check();
+		if (!covering.length && !job.holding) deliver(job);
+	};
+	const startJob = (
+		tasks: TaskInput[],
+		run: (signal: AbortSignal, results: SingleResult[], job: Job) => Promise<unknown>,
+		placeholder: (t: TaskInput) => SingleResult,
+	): Job => {
+		const job: Job = {
+			id: `job-${++jobCounter}`,
+			status: "running",
+			results: tasks.map(placeholder),
+			controller: new AbortController(), // not linked to the tool call: the job outlives it
+			delivered: false,
+			holding: false,
+			questions: new Map(),
+			done: Promise.resolve(),
+		};
+		jobs.set(job.id, job);
+		job.done = run(job.controller.signal, job.results, job).then(() => settle(job), () => settle(job));
+		return job;
+	};
+
 	// Pi awaits this before tearing the runtime down (quit, reload, session replacement).
 	pi.on("session_shutdown", async () => {
+		closed = true;
+		shutdownController.abort();
+		for (const job of jobs.values()) {
+			job.controller.abort();
+			for (const q of job.questions.values()) clearTimeout(q.timer);
+		}
+		for (const wait of [...waits]) wait.finish("abort");
 		await runner.shutdown();
+		await Promise.allSettled([...finalizing]);
 	});
 
 	// The model can only name agents it knows about. List them here so no AGENTS.md roster is
@@ -579,12 +904,174 @@ export default function (pi: ExtensionAPI) {
 				runner, ctx.cwd,
 				{ model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined, thinkingLevel: ctx.thinkingLevel },
 				discoverAgents(ctx.cwd, "user").agents, "advisor", params.task, params.cwd,
-				signal, onUpdate, makeDetails, true,
+				signal, onUpdate, makeDetails, { consultation: true },
 			);
 			return {
 				content: [{ type: "text", text: truncateModelVisibleOutput(getResultOutput(result)) }],
 				details: makeDetails([result]), usage: sumUsage([result]), isError: isFailedResult(result),
 			};
+		},
+	});
+
+	const jobDetails: SubagentDetails = { mode: "parallel", agentScope: "user", projectAgentsDir: null, results: [] };
+	const textResult = (text: string, extra: { usage?: Usage; isError?: boolean } = {}) => ({
+		content: [{ type: "text" as const, text }],
+		details: jobDetails,
+		...extra,
+	});
+
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent status",
+		description: "List background subagent jobs started with subagent background: true, with the state of each task.",
+		promptSnippet: "List background subagent jobs and their task states",
+		parameters: Type.Object({}, { additionalProperties: false }),
+		async execute() {
+			if (jobs.size === 0) return textResult("No background jobs.");
+			const lines = [...jobs.values()].map((job) => {
+				const states = taskStates(job);
+				const done = states.filter((t) => t.status !== "queued" && t.status !== "running").length;
+				const note = job.delivered ? ", output delivered" : job.status === "running" ? "" : ", output not yet delivered";
+				const open = [...job.questions.values()].map((q) => `\n  open question ${q.id} from ${q.agent}: ${truncateUtf8(q.text, 120, "...")}`).join("");
+				return `${job.id} ${job.status}: ${done}/${states.length} tasks done${note} [${states.map((t) => `${t.agent}: ${t.status}`).join(", ")}]${open}`;
+			});
+			return textResult(lines.join("\n"));
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Subagent wait",
+		description:
+			"Block until the given background jobs finish, then return their output. Use it only when you have nothing else to do meanwhile; otherwise keep working, because each job's output also arrives as a follow-up message. With timeoutMs, returns what has finished and the state of the rest. A job whose output was already delivered is not returned again.",
+		promptSnippet: "Wait for background subagent jobs and return their output",
+		parameters: Type.Object({
+			jobIds: Type.Array(Type.String(), { minItems: 1, maxItems: MAX_PARALLEL_TASKS, description: "Job ids returned by subagent with background: true" }),
+			timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Stop waiting after this many milliseconds" })),
+		}),
+		async execute(_toolCallId, params, signal) {
+			const unknown = params.jobIds.filter((id) => !jobs.has(id));
+			if (unknown.length) return textResult(`Unknown job: ${unknown.join(", ")}. Use subagent_status to list jobs.`, { isError: true });
+			const sections: string[] = [];
+			const ids = new Set<string>();
+			for (const id of new Set(params.jobIds)) {
+				if (jobs.get(id)!.delivered) sections.push(`Job ${id}: output was already delivered.`);
+				else ids.add(id);
+			}
+			let reason: "done" | "timeout" | "abort" | "question" = "done";
+			if (ids.size) {
+				const wait: Wait = { ids, check: () => {}, finish: () => {} };
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				let onAbort: (() => void) | undefined;
+				try {
+					await new Promise<void>((resolve) => {
+						const finish = (why: typeof reason) => {
+							reason = why;
+							resolve();
+						};
+						wait.finish = finish;
+						// A question wakes the wait: a follow-up message would sit queued until this turn ends.
+						wait.check = () => {
+							if ([...ids].every((id) => jobs.get(id)!.status !== "running")) finish("done");
+							else if ([...ids].some((id) => pendingQuestions(jobs.get(id)!).length)) finish("question");
+						};
+						waits.add(wait);
+						onAbort = () => finish("abort");
+						if (signal?.aborted) onAbort();
+						else signal?.addEventListener("abort", onAbort, { once: true });
+						if (params.timeoutMs) timer = setTimeout(() => finish("timeout"), params.timeoutMs);
+						wait.check();
+					});
+				} finally {
+					waits.delete(wait);
+					clearTimeout(timer);
+					if (onAbort) signal?.removeEventListener("abort", onAbort);
+				}
+				if (reason === "abort") {
+					// The tool result may never reach the model, so finished output goes by message instead.
+					for (const id of ids) if (jobs.get(id)!.status !== "running") deliver(jobs.get(id)!);
+					return textResult("Wait cancelled. Finished jobs are delivered as follow-up messages.", { isError: true });
+				}
+			}
+			const taken: SingleResult[] = [];
+			for (const id of ids) {
+				const job = jobs.get(id)!;
+				if (job.status === "running") {
+					const states = taskStates(job);
+					sections.push(`Job ${id}: still running (${states.filter((t) => t.status !== "queued" && t.status !== "running").length}/${states.length} tasks done).`);
+					for (const q of pendingQuestions(job)) {
+						q.shown = true;
+						sections.push(questionText(q, Math.max(1, Math.round(askTimeoutMs / 60000))));
+					}
+				} else if (job.holding) sections.push(`Job ${id}: being cancelled; subagent_cancel returns its output.`);
+				else sections.push(consume(job, taken));
+			}
+			return textResult(sections.join("\n\n---\n\n"), { usage: sumUsage(taken) });
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_reply",
+		label: "Subagent reply",
+		description: "Answer a question that a background subagent asked with ask_parent. Use the jobId and requestId from the question. An expired question cannot be answered; the child has already continued.",
+		promptSnippet: "Answer a question from a background subagent",
+		parameters: Type.Object({
+			jobId: Type.String(),
+			requestId: Type.String(),
+			answer: Type.String({ description: "The answer, as the child should read it" }),
+		}),
+		async execute(_toolCallId, params) {
+			const q = jobs.get(params.jobId)?.questions.get(params.requestId);
+			if (!q) {
+				return textResult(`Question ${params.requestId} is unknown or expired. The child already continued on its own assumption.`, { isError: true });
+			}
+			clearTimeout(q.timer);
+			jobs.get(params.jobId)!.questions.delete(q.id);
+			q.respond(params.answer);
+			return textResult(`Answer sent to ${q.agent}.`);
+		},
+	});
+
+	// Runs in the child. Only agents that list it get it; it needs the RPC transport a background job provides.
+	pi.registerTool({
+		name: "ask_parent",
+		label: "Ask parent",
+		description: "Ask the parent agent one question when you are blocked on a decision only it can make. It may take minutes and may go unanswered.",
+		promptSnippet: "Ask the parent a blocking question",
+		defaultActive: false,
+		promptGuidelines: [
+			"Ask only when you are blocked on a decision that only the parent can make, with the question and the options in one self-contained message. Do not ask for routine choices.",
+			"If no answer arrives, state the assumption you are making and continue, or stop and report that you are blocked.",
+		],
+		parameters: Type.Object({ question: Type.String({ description: "A self-contained question, with the options you see" }) }, { additionalProperties: false }),
+		async execute(_toolCallId, params, signal, _observer, ctx) {
+			const noAnswer = "No answer arrived. State the assumption you are making and continue, or stop and report that you are blocked.";
+			if (process.env.PI_SUBAGENT_ASK_PARENT !== "1" || ctx.mode !== "rpc") {
+				return textResult("No parent can answer in this run. State your assumption and continue, or stop and report that you are blocked.");
+			}
+			const timeout = Number(process.env[ASK_TIMEOUT_ENV]) > 0 ? Number(process.env[ASK_TIMEOUT_ENV]) : ASK_TIMEOUT_MS;
+			const answer = await ctx.ui.input(ASK_PREFIX + truncateUtf8(params.question, QUESTION_BYTES, "..."), undefined, { timeout, signal });
+			return textResult(answer ? answer : noAnswer);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Subagent cancel",
+		description: "Stop a background job: running children are terminated and queued tasks never start. Returns the partial output.",
+		promptSnippet: "Cancel a background subagent job",
+		parameters: Type.Object({ jobId: Type.String({ description: "Job id returned by subagent with background: true" }) }),
+		async execute(_toolCallId, params) {
+			const job = jobs.get(params.jobId);
+			if (!job) return textResult(`Unknown job: ${params.jobId}. Use subagent_status to list jobs.`, { isError: true });
+			if (job.delivered) return textResult(`Job ${job.id}: output was already delivered.`);
+			job.holding = true; // the output goes to this call, not to a follow-up message
+			job.controller.abort();
+			await job.done;
+			if (job.delivered) return textResult(`Job ${job.id}: output was already delivered.`);
+			const taken: SingleResult[] = [];
+			const text = consume(job, taken);
+			return textResult(text, { usage: sumUsage(taken) });
 		},
 	});
 
@@ -596,6 +1083,8 @@ export default function (pi: ExtensionAPI) {
 			"Supported modes: single (agent + task) and parallel (tasks array, maximum 32).",
 			`At most ${limits.base} subagent processes run at once per Pi runtime (PI_SUBAGENT_MAX_CONCURRENCY, 1-16); extra tasks wait in FIFO order.`,
 			`In parallel mode, maxConcurrency may raise that to at most ${limits.ceiling} for the call; use it only for independent read-only work.`,
+			"isolation: \"worktree\" runs a task in its own git worktree and branch; the parent merges the branch and removes the lane.",
+			"background: true returns a job id at once; the result arrives as a follow-up message, or from subagent_wait. subagent_status and subagent_cancel manage jobs.",
 			`Agents are loaded from ${path.join(getAgentDir(), "agents")}.`,
 			rosterText,
 		].join(" "),
@@ -604,7 +1093,10 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself. Pick the agent whose description fits; do not run a fixed explore, plan, implement, review pipeline.",
 			"Give each subagent a self-contained brief: goal, scope, constraints, owned files for edits, exact acceptance commands, and the exact result to return. It cannot see this conversation.",
-			"Run independent tasks in one parallel call. Never give parallel tasks overlapping writable files; run overlapping edits one after another.",
+			"Run independent tasks in one parallel call. Never give parallel tasks overlapping writable files in one checkout; run overlapping edits one after another, or give each writer isolation: \"worktree\".",
+			"isolation: \"worktree\" gives a task its own git worktree and branch from HEAD, without your uncommitted changes. Add setup (for example a dependency install) when checks need it. The extension commits a completed lane's changes. It never merges or removes anything. You merge each branch with git merge (no squash), resolve conflicts and run the checks on the combined state.",
+			"Remove every lane yourself as soon as its branch is merged, or after a failed lane has been inspected, using the exact commands in its result. Never add --force to remove a dirty lane without asking the user. Your final report lists any lane left in place and why.",
+			"Use background: true only when you have other independent work to do while the helpers run; otherwise call subagent normally. Do not poll: the result arrives as a follow-up message, so end your turn or keep working. Call subagent_wait only when you have nothing else left to do. Dependent steps are separate waves you start yourself after a job's result. Background tasks share the same limit as blocking calls, so a blocking call can queue behind them.",
 			"Treat results as unverified. Before reporting success, inspect the combined diff and check the acceptance criteria yourself.",
 		],
 		parameters: SubagentParams,
@@ -672,35 +1164,107 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+			const requests = params.tasks?.length ? params.tasks : [params];
+			if (requests.some((r) => r.setup && !r.isolation)) {
+				return {
+					content: [{ type: "text", text: "Invalid parameters. setup requires isolation: \"worktree\"." }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+			const laneFor = (r: { isolation?: "worktree"; setup?: string }): LaneRequest | undefined =>
+				r.isolation ? { setup: r.setup, shutdown: shutdownController.signal, track: trackFinalization } : undefined;
+
+			if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
+				return {
+					content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+					details: makeDetails("parallel")([]),
+				};
+			}
+
+			const baseCwd = ctx.cwd;
+			const placeholder = (t: TaskInput): SingleResult => ({
+				agent: t.agent,
+				agentSource: "unknown",
+				task: t.task,
+				exitCode: -1, // -1 = no exit yet; see status
+				status: "queued",
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				fullUsage: emptyUsage(),
+			});
+			// The shared limiter bounds active children; every task keeps its own result in `results`.
+			// Nothing here touches `ctx` or the tool call after it returns, so background jobs can reuse it.
+			const runTasks = (
+				tasks: TaskInput[],
+				taskSignal: AbortSignal | undefined,
+				results: SingleResult[],
+				onChange?: () => void,
+				rpcFor?: (index: number) => RpcHooks,
+			) =>
+				Promise.all(
+					tasks.map(async (t, index) => {
+						let result: SingleResult;
+						try {
+							result = await runSingleAgent(
+								runner,
+								baseCwd,
+								dispatchDefaults,
+								agents,
+								t.agent,
+								t.task,
+								t.cwd,
+								taskSignal,
+								(partial) => {
+									if (partial.details?.results[0]) {
+										results[index] = partial.details.results[0];
+										onChange?.();
+									}
+								},
+								makeDetails("parallel"),
+								{ lane: laneFor(t), rpc: rpcFor?.(index) },
+							);
+						} catch (error) {
+							result = {
+								...results[index],
+								exitCode: 1,
+								status: "failed",
+								stderr: error instanceof Error ? error.message : String(error),
+							};
+						}
+						results[index] = result;
+						onChange?.();
+						return result;
+					}),
+				);
+
+			if (params.background) {
+				if (params.maxConcurrency !== undefined) {
+					// A raise would lift the limit for every caller for the whole job.
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = no exit yet; see status
-						status: "queued",
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-						fullUsage: emptyUsage(),
+						content: [{ type: "text", text: "Invalid parameters. maxConcurrency cannot be combined with background." }],
+						details: makeDetails("single")([]),
+						isError: true,
 					};
 				}
+				const tasks: TaskInput[] = params.tasks?.length
+					? params.tasks
+					: [{ agent: params.agent!, task: params.task!, cwd: params.cwd, isolation: params.isolation, setup: params.setup }];
+				const job = startJob(
+					tasks,
+					(taskSignal, results, started) => runTasks(tasks, taskSignal, results, undefined, (index) => rpcHooks(started, index)),
+					placeholder,
+				);
+				return {
+					content: [{ type: "text", text: `Job ${job.id} started (${tasks.length} task${tasks.length === 1 ? "" : "s"}). Its result is delivered when it finishes; keep working, or call subagent_wait.` }],
+					details: makeDetails("parallel")([]),
+				};
+			}
+
+			if (params.tasks && params.tasks.length > 0) {
+				// Track all results for streaming updates
+				const allResults: SingleResult[] = params.tasks.map(placeholder);
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
@@ -719,7 +1283,6 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				// The shared limiter bounds active children; every task keeps its own result.
 				// A raise lasts only for this call so it cannot leak into later calls.
 				const lowerLimit = params.maxConcurrency ? runner.raise(params.maxConcurrency) : undefined;
 				// Say so when the request could not be honored, so the model does not assume more parallelism.
@@ -734,76 +1297,13 @@ export default function (pi: ExtensionAPI) {
 								: "";
 				let results: SingleResult[];
 				try {
-				results = await Promise.all(
-					params.tasks.map(async (t, index) => {
-						let result: SingleResult;
-						try {
-							result = await runSingleAgent(
-								runner,
-								ctx.cwd,
-								dispatchDefaults,
-								agents,
-								t.agent,
-								t.task,
-								t.cwd,
-								signal,
-								// Per-task update callback
-								(partial) => {
-									if (partial.details?.results[0]) {
-										allResults[index] = partial.details.results[0];
-										emitParallelUpdate();
-									}
-								},
-								makeDetails("parallel"),
-							);
-						} catch (error) {
-							result = {
-								...allResults[index],
-								exitCode: 1,
-								status: "failed",
-								stderr: error instanceof Error ? error.message : String(error),
-							};
-						}
-						allResults[index] = result;
-						emitParallelUpdate();
-						return result;
-					}),
-				);
+					results = await runTasks(params.tasks, signal, allResults, emitParallelUpdate);
 				} finally {
 					lowerLimit?.();
 				}
 
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const headers = results.map((r) => {
-					const status =
-						getStatus(r) === "aborted"
-							? "aborted"
-							: isFailedResult(r)
-								? `failed${getFailureReason(r) ? ` (${getFailureReason(r)})` : ""}`
-								: "completed";
-					return `### [${truncateUtf8(r.agent, 128, "...")}] ${status}\n\n`;
-				});
-				const prefix = `${limitNote}Parallel: ${successCount}/${results.length} succeeded\n\n`;
-				const separator = "\n\n---\n\n";
-				const overhead = Buffer.byteLength(prefix + headers.join(separator));
-				const outputs = results.map(getResultOutput);
-				const demands = outputs.map((text, index) => ({ index, bytes: Math.min(MODEL_VISIBLE_OUTPUT_CAP, Buffer.byteLength(text)) }))
-					.sort((a, b) => a.bytes - b.bytes);
-				const budgets = new Array<number>(results.length);
-				let remaining = BATCH_OUTPUT_BYTES - overhead;
-				for (let i = 0; i < demands.length; i++) {
-					const { index, bytes } = demands[i];
-					budgets[index] = Math.min(bytes, Math.floor(remaining / (demands.length - i)));
-					remaining -= budgets[index];
-				}
-				const summaries = results.map((_r, i) => headers[i] + truncateModelVisibleOutput(outputs[i], budgets[i]));
 				return {
-					content: [
-						{
-							type: "text",
-							text: prefix + summaries.join(separator),
-						},
-					],
+					content: [{ type: "text", text: formatBatch(results, limitNote) }],
 					details: makeDetails("parallel")(results),
 					usage: sumUsage(results),
 				};
@@ -821,13 +1321,16 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+					{ lane: laneFor(params) },
 				);
 				const isError = isFailedResult(result);
+				const laneBlock = result.worktree ? `${formatLane(result.worktree)}\n\n` : "";
+				const capped = (body: string) => laneBlock + truncateModelVisibleOutput(body, MODEL_VISIBLE_OUTPUT_CAP - Buffer.byteLength(laneBlock));
 				if (isError) {
 					const errorMsg = getResultOutput(result);
 					return {
 						content: [
-							{ type: "text", text: truncateModelVisibleOutput(`Agent ${result.stopReason && !NORMAL_STOP_REASONS.has(result.stopReason) ? result.stopReason : `failed${getFailureReason(result) ? ` (${getFailureReason(result)})` : ""}`}: ${errorMsg}`) },
+							{ type: "text", text: capped(`Agent ${result.stopReason && !NORMAL_STOP_REASONS.has(result.stopReason) ? result.stopReason : `failed${getFailureReason(result) ? ` (${getFailureReason(result)})` : ""}`}: ${errorMsg}`) },
 						],
 						details: makeDetails("single")([result]),
 						usage: sumUsage([result]),
@@ -836,7 +1339,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [
-						{ type: "text", text: truncateModelVisibleOutput(getResultOutput(result)) },
+						{ type: "text", text: capped(getResultOutput(result)) },
 					],
 					details: makeDetails("single")([result]),
 					usage: sumUsage([result]),
@@ -888,6 +1391,8 @@ export default function (pi: ExtensionAPI) {
 				if (status === "aborted") return t.fg("warning", "⊘");
 				return isFailedResult(r) ? t.fg("error", "✗") : t.fg("success", "✓");
 			};
+			const laneLine = (r: SingleResult) =>
+				r.worktree ? theme.fg("muted", `⎇ ${r.worktree.branch} (${describeLaneState(r.worktree)})`) : "";
 			const placeholderFor = (r: SingleResult) => {
 				const status = getStatus(r);
 				return status === "queued" ? "(queued...)" : status === "running" ? "(running...)" : "(no output)";
@@ -925,6 +1430,7 @@ export default function (pi: ExtensionAPI) {
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (diagnostic) container.addChild(new Text(theme.fg("error", `Error: ${diagnostic}`), 0, 0));
+					if (r.worktree) container.addChild(new Text(laneLine(r), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
@@ -958,6 +1464,7 @@ export default function (pi: ExtensionAPI) {
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}${stateLabel}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				if (r.worktree) text += `\n${laneLine(r)}`;
 				if (diagnostic) text += `\n${theme.fg("error", `Error: ${diagnostic}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", finalOutput ? truncateModelVisibleOutput(finalOutput) : placeholderFor(r))}`;
 				else {
@@ -1017,6 +1524,7 @@ export default function (pi: ExtensionAPI) {
 							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						if (r.worktree) container.addChild(new Text(laneLine(r), 0, 0));
 						const diagnostic = getFailureDiagnostic(r);
 						if (diagnostic) container.addChild(new Text(theme.fg("error", `Error: ${diagnostic}`), 0, 0));
 
@@ -1058,6 +1566,7 @@ export default function (pi: ExtensionAPI) {
 					const displayItems = getDisplayItems(r.messages);
 					const rState = isPending(r) ? theme.fg("warning", ` [${getStatus(r)}]`) : "";
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}${rState}`;
+					if (r.worktree) text += `\n${laneLine(r)}`;
 					const diagnostic = getFailureDiagnostic(r);
 					if (diagnostic) text += `\n${theme.fg("error", `Error: ${diagnostic}`)}`;
 					else if (displayItems.length === 0) text += `\n${theme.fg("muted", getFinalOutput(r) ? truncateModelVisibleOutput(getFinalOutput(r)) : placeholderFor(r))}`;
