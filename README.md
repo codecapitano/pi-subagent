@@ -40,13 +40,18 @@ Tool allowlists limit what an agent can call. They are not a sandbox.
 - Optional isolated writer lanes: a task can run in its own git worktree and
   branch, which the parent merges and removes
   (see [Worktree lanes](#worktree-lanes)).
+- Optional background jobs: start a batch, keep working, and get the result as a
+  follow-up message or from `subagent_wait`
+  (see [Background jobs](#background-jobs)).
+- Background children can ask the parent one question and wait for the answer
+  (see [Child questions](#child-questions)).
 - Bounded output and per-task results, so a large batch cannot flood the parent's
   context. One failed task does not lose the others.
 - Clean cancellation and shutdown. Cancelled tasks never start, and running
   helpers are stopped.
 
-Developed and tested against Pi 1.2 and 1.3. Offline tests use fake child
-processes and make no model calls.
+Developed against Pi 1.4 and tested in CI against Pi 1.3. Offline tests use fake
+child processes and temporary git repositories, and make no model calls.
 
 ## Install
 
@@ -191,9 +196,12 @@ parent cannot answer mid-call.
   reply is refused with a clear message.
 - RPC mode gives every extension in the child a UI. The parent therefore declines any
   dialog that is not an `ask_parent` question at once, and ignores notifications.
-- Children load the extension that is **installed** in `~/.pi/agent/extensions`, so
-  install this version before relying on `ask_parent`. Without it the agent has no
-  such tool.
+- Children load the extension that is **installed** in `~/.pi/agent/extensions` (or
+  the package you installed), so use this version before relying on `ask_parent`.
+  Without it the agent has no such tool.
+- **Existing agents:** the starters are copied only once. To let your own `implementer`
+  ask questions, add `ask_parent` to its `tools` line and run `/reload`. Agents
+  without it keep the one-way JSON transport.
 - Outside a background job, `ask_parent` answers immediately that no parent is
   available.
 
@@ -417,6 +425,7 @@ node --test --test-timeout=30000 *.test.mjs
 ```
 
 The tests cover the scheduler, cancellation, output bounds, rendering, installer,
+worktree lanes in temporary git repositories, background jobs, child questions,
 and actual Pi extension loading with fake child processes. They make no paid
 model calls. The 1,000-submission scheduler test uses simulated processes.
 
@@ -427,12 +436,12 @@ or tested.
 
 ## Status and known limitations
 
-This is an early release (0.3). Please read these before relying on it:
+This is an early release. Please read these before relying on it:
 
-- **Package install checked once.** One real Pi session loaded `v0.2.0` through
-  `pi -e git:github.com/codecapitano/pi-subagent@v0.2.0`. The model read the agent
-  list from the tool description, made a parallel call with two tasks, and the result
-  carried the clamp notice. This was a single short run, not a long-term test.
+- **Checked by hand, briefly.** In real Pi sessions: a package install of `v0.2.0`
+  with a parallel call; two `implementer` agents in worktree lanes that were merged
+  and cleaned up; one background job whose child asked a question, received the
+  answer and finished. These were short runs, not a long-term test.
 - **Agents are not bundled automatically.** Copy the starter agents yourself (see
   [Define agents](#define-agents)). The agent list in the tool description is read at
   load, so run `/reload` after changing agents.
@@ -444,7 +453,8 @@ This is an early release (0.3). Please read these before relying on it:
 - **Legacy code.** Old stored calls that use `chain` or a project scope are
   rejected by a small compatibility check.
 - **Unverified in practice.** The tests use fake child processes. Real provider rate
-  limits, throughput and how models use `maxConcurrency` have not been measured.
+  limits, throughput, and how models use `maxConcurrency`, `background` and
+  `isolation` have not been measured.
 
 ## Credits and license
 

@@ -7,11 +7,14 @@
  * Local policy supports two modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
+ * Either can run in its own git worktree (`isolation`) or as a background job (`background`),
+ * which also lets a child ask the parent a question (`ask_parent`).
  *
  * Chain and project-agent execution from the upstream example are retained only
  * for compatibility with stored calls and rejected before execution.
  *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses JSON mode to capture structured output from subagents. Background tasks of agents that
+ * list `ask_parent` use RPC mode instead, so the child can ask the parent a question.
  */
 
 import { spawn } from "node:child_process";
