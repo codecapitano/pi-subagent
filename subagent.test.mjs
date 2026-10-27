@@ -2,34 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseConcurrency } from "./lifecycle.mjs";
 
-test("concurrency defaults to base 6 and ceiling 8 when unset or empty", () => {
-	assert.deepEqual(parseConcurrency({}), { base: 6, ceiling: 8 });
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: "", PI_SUBAGENT_CONCURRENCY_CEILING: "" }), { base: 6, ceiling: 8 });
+test("concurrency defaults to 4 when unset, empty or not a number", () => {
+	for (const value of [undefined, "", " ", "abc"]) {
+		assert.equal(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: value }), 4, `value ${JSON.stringify(value)}`);
+	}
+	assert.equal(parseConcurrency({}), 4);
 });
 
-test("concurrency accepts base integers 1 through 16; an unset ceiling never sits below the base", () => {
-	for (const n of Array.from({ length: 16 }, (_, i) => i + 1)) {
-		assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: String(n) }), { base: n, ceiling: Math.max(n, 8) });
-	}
-});
-
-test("ceiling is configurable and must not be below the base", () => {
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: "12" }), { base: 6, ceiling: 12 });
-	assert.deepEqual(parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: "2", PI_SUBAGENT_CONCURRENCY_CEILING: "2" }), { base: 2, ceiling: 2 });
-	assert.throws(() => parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: "5" }), /PI_SUBAGENT_CONCURRENCY_CEILING.*below/);
-	for (const bad of ["0", "17", "abc"]) {
-		assert.throws(() => parseConcurrency({ PI_SUBAGENT_CONCURRENCY_CEILING: bad }), /PI_SUBAGENT_CONCURRENCY_CEILING.*integer from 1 to 16/);
-	}
-});
-
-test("concurrency rejects invalid values with a clear error naming the variable", () => {
-	for (const bad of ["0", "17", "-1", "2.5", "abc", "1e1", " ", "0x2", "2 3"]) {
-		assert.throws(
-			() => parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: bad }),
-			/PI_SUBAGENT_MAX_CONCURRENCY.*integer from 1 to 16/,
-			`value ${JSON.stringify(bad)}`,
-		);
-	}
+test("concurrency is clamped to 1 through 16", () => {
+	const limit = (value) => parseConcurrency({ PI_SUBAGENT_MAX_CONCURRENCY: value });
+	assert.deepEqual(["0", "-3", "1", "7", "16", "17", "99", "2.9"].map(limit), [1, 1, 1, 7, 16, 16, 16, 2]);
 });
 
 // ---------------------------------------------------------------------------
@@ -60,7 +42,7 @@ class FakeProc extends EventEmitter {
 	}
 }
 
-function world(capacity = 4, ceiling = capacity) {
+function world(capacity = 4, kill = undefined) {
 	const w = {
 		procs: [],
 		spawnCalls: [],
@@ -84,7 +66,7 @@ function world(capacity = 4, ceiling = capacity) {
 	};
 	w.runner = createChildRunner({
 		capacity,
-		ceiling,
+		kill,
 		spawn: w.spawn,
 		setTimeout: w.setTimeout,
 		clearTimeout: w.clearTimeout,
@@ -147,61 +129,6 @@ test("capacity limits active children and queued runs start FIFO", async () => {
 	w.procs[3].exit(0);
 	await Promise.all(ps);
 	assert.deepEqual(w.runner.stats(), { active: 0, queued: 0 });
-});
-
-test("raise starts queued work immediately, clamps to the ceiling and never exceeds it", async () => {
-	const w = world(2, 4);
-	const ps = ["a", "b", "c", "d", "e", "f"].map((n) => w.runner.run(spec(n)));
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 2, queued: 4 });
-	const lower = w.runner.raise(12);
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 4, queued: 2 });
-	lower();
-	lower(); // idempotent
-	for (const p of w.procs.slice()) p.exit(0);
-	await tick();
-	// Back to the base limit: only two of the remaining runs start.
-	assert.deepEqual(w.runner.stats(), { active: 2, queued: 0 });
-	for (const p of w.procs.slice(4)) p.exit(0);
-	await Promise.all(ps);
-});
-
-test("lowering a raise kills nothing and grants no new slot until active drops below the base", async () => {
-	const w = world(1, 3);
-	const ps = ["a", "b", "c", "d"].map((n) => w.runner.run(spec(n)));
-	const lower = w.runner.raise(3);
-	await tick();
-	assert.deepEqual(w.runner.stats(), { active: 3, queued: 1 });
-	lower();
-	assert.ok(w.procs.every((p) => p.kills.length === 0));
-	w.procs[0].exit(0);
-	w.procs[1].exit(0);
-	await tick();
-	assert.equal(w.procs.length, 3); // d still waits: active 1 is not below base 1
-	w.procs[2].exit(0);
-	await tick();
-	assert.equal(w.procs.length, 4);
-	w.procs[3].exit(0);
-	await Promise.all(ps);
-});
-
-test("overlapping raises release independently, even at the same value", async () => {
-	const w = world(1, 4);
-	const first = w.runner.raise(3);
-	const second = w.runner.raise(3);
-	const ps = ["a", "b", "c"].map((n) => w.runner.run(spec(n)));
-	await tick();
-	assert.equal(w.procs.length, 3);
-	first();
-	const late = w.runner.run(spec("d"));
-	await tick();
-	assert.equal(w.procs.length, 3); // second raise still allows 3 active, all slots busy
-	second();
-	for (const p of w.procs) p.exit(0);
-	await tick();
-	w.procs[3].exit(0);
-	await Promise.all([...ps, late]);
 });
 
 test("prepare failure is reported as failed without spawning and frees the slot", async () => {
@@ -391,6 +318,40 @@ test("no KILL is sent when the child already exited before the grace timer fires
 	await p;
 });
 
+test("a detached child is signalled as a process group, SIGKILL included", async () => {
+	const groupKills = [];
+	const w = world(4, (pid, sig) => groupKills.push([pid, sig]));
+	const ac = new AbortController();
+	const p = w.runner.run({ ...spec("a", { signal: ac.signal }), prepare: () => ({ command: "pi", args: [], cwd: "/", detached: true, env: { X: "1" } }) });
+	await tick();
+	assert.equal(w.spawnCalls[0].options.detached, true);
+	assert.deepEqual(w.spawnCalls[0].options.env, { X: "1" });
+	ac.abort();
+	// The group leader may be gone while a descendant still holds the pipes open.
+	w.procs[0].exitCode = 0;
+	w.timers[0].fn();
+	assert.deepEqual(groupKills, [[-1000, "SIGTERM"], [-1000, "SIGKILL"]]);
+	assert.deepEqual(w.procs[0].kills, []);
+	w.procs[0].emit("close", 0, null);
+	assert.equal((await p).status, "aborted");
+});
+
+test("a group kill that fails falls back to the direct pid, and children are not detached by default", async () => {
+	const w = world(4, () => { throw Object.assign(new Error("no such process"), { code: "ESRCH" }); });
+	const ac = new AbortController();
+	const detached = w.runner.run({ ...spec("a", { signal: ac.signal }), prepare: () => ({ command: "pi", args: [], cwd: "/", detached: true }) });
+	const plain = w.runner.run(spec("b"));
+	await tick();
+	assert.equal(w.spawnCalls[0].options.detached, true);
+	assert.equal(w.spawnCalls[1].options.detached, false);
+	ac.abort();
+	assert.deepEqual(w.procs[0].kills, ["SIGTERM"]);
+	w.procs[0].exit(null, "SIGTERM");
+	w.procs[1].exit(0);
+	assert.equal((await detached).status, "aborted");
+	assert.equal((await plain).status, "completed");
+});
+
 test("a throwing kill does not break settlement", async () => {
 	const w = world();
 	const ac = new AbortController();
@@ -546,6 +507,7 @@ const { loadExtensions } = await import(`${PI_CORE}/dist/core/extensions/loader.
 
 const FAKE_PI = `
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 const task = process.argv.at(-1).replace(/^Task: /, "");
 const log = process.env.FAKE_PI_LOG;
 const note = (k) => fs.appendFileSync(log, k + " " + process.pid + " " + JSON.stringify(task) + "\\n");
@@ -558,7 +520,7 @@ let done = false;
 const finish = (code) => {
 	if (done) return;
 	done = true;
-	const text = /huge/.test(task) ? "answer " + "é".repeat(1024 * 1024) : /big/.test(task) ? "x".repeat(40000) : "cwd=" + process.cwd() + " task=" + task + " args=" + process.argv.slice(2, -1).join(" ");
+	const text = /huge/.test(task) ? "answer " + "é".repeat(1024 * 1024) : /big/.test(task) ? "x".repeat(40000) : "cwd=" + process.cwd() + " task=" + task + " args=" + process.argv.slice(2, -1).join(" ") + (/showenv/.test(task) ? " depth=" + process.env.PI_SUBAGENT_DEPTH + " groupLeader=" + (Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)])) === process.pid) : "");
 	if (/noisy/.test(task)) for (let i = 0; i < 100; i++) process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "n".repeat(20000) }], usage: { input: 1, output: 1 }, stopReason: "stop" } }) + "\\n");
 	if (/usage(?!-early)/.test(task)) {
 		emit(assistantUsage(U(1, { reasoning: 2, cacheWrite1h: 1 })));
@@ -600,9 +562,9 @@ function makeEnv() {
 	return { root, agentDir, tmp, log, fakePi };
 }
 
-const ENV_KEYS = ["PI_CODING_AGENT_DIR", "FAKE_PI_LOG", "TMPDIR", "PI_SUBAGENT_MAX_CONCURRENCY", "PI_SUBAGENT_CONCURRENCY_CEILING"];
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "FAKE_PI_LOG", "TMPDIR", "PI_SUBAGENT_MAX_CONCURRENCY", "PI_SUBAGENT_DEPTH"];
 
-async function withExtension(maxConcurrency, fn, ceiling) {
+async function withExtension(maxConcurrency, fn, depth) {
 	const e = makeEnv();
 	const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 	const savedArgv1 = process.argv[1];
@@ -611,8 +573,8 @@ async function withExtension(maxConcurrency, fn, ceiling) {
 	process.env.TMPDIR = e.tmp;
 	if (maxConcurrency === undefined) delete process.env.PI_SUBAGENT_MAX_CONCURRENCY;
 	else process.env.PI_SUBAGENT_MAX_CONCURRENCY = maxConcurrency;
-	if (ceiling === undefined) delete process.env.PI_SUBAGENT_CONCURRENCY_CEILING;
-	else process.env.PI_SUBAGENT_CONCURRENCY_CEILING = ceiling;
+	if (depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+	else process.env.PI_SUBAGENT_DEPTH = depth;
 	process.argv[1] = e.fakePi;
 	let ext;
 	try {
@@ -675,110 +637,12 @@ const pidAlive = (pid) => {
 };
 const P = (n, extra = "") => ({ agent: "worker", task: `t${n} ${extra}` });
 
-test("consult_advisor fixes its target and forces read-only tools with MCP disabled", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor", "Advisor marker").replace("tools: read", "tools: bash,write,edit,subagent,consult_advisor"));
-		const tool = ext.tools.get("consult_advisor")?.definition;
-		assert.ok(tool, "consult_advisor must be registered");
-		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["cwd", "task"]);
-		const result = await tool.execute("id", { task: "question", cwd: path.join(e.root, "b"), agent: "worker" }, undefined, undefined, { cwd: e.root });
-		assert.equal(result.details.results[0].agent, "advisor");
-		assert.equal(result.details.results[0].agentSource, "user");
-		assert.match(text(result), /--tools read,grep,find,ls --no-mcp/);
-		assert.match(text(result), new RegExp(`cwd=${path.join(e.root, "b")}`));
-		assert.ok(!result.isError);
-	});
-});
-
-test("consult_advisor claims its only attempt before concurrent calls and keeps it after failure", async () => {
-	await withExtension(undefined, async ({ e, ext, events }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const call = (task) => tool.execute("id", { task }, undefined, undefined, { cwd: e.root });
-		const first = call("sleep:80 fail");
-		const second = await call("second");
-		assert.equal(second.isError, true);
-		assert.match(text(second), /already.*attempt|attempt.*used/i);
-		assert.match(text(second), /escalate.*parent/i);
-		await until(() => events().some((e) => e.kind === "S"));
-		assert.equal((await first).isError, true);
-		assert.equal((await call("third")).isError, true);
-		assert.equal(events().filter((e) => e.kind === "S").length, 1);
-	});
-});
-
-test("consult_advisor reports a missing user advisor and consumes the failed attempt", async () => {
-	await withExtension(undefined, async ({ e, ext, events }) => {
-		const projectAgents = path.join(e.root, ".pi", "agents");
-		fs.mkdirSync(projectAgents, { recursive: true });
-		fs.writeFileSync(path.join(projectAgents, "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const call = () => tool.execute("id", { task: "question" }, undefined, undefined, { cwd: e.root });
-		const result = await call();
-		assert.equal(result.isError, true);
-		assert.match(text(result), /Unknown agent: "advisor"/);
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		assert.match(text(await call()), /escalate.*parent/i);
-		assert.equal(events().length, 0);
-	});
-});
-
-test("consult_advisor forwards nested usage and tolerates observer failures", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		let updates = 0;
-		const result = await tool.execute("id", { task: "usage" }, undefined, () => {
-			updates++;
-			throw new Error("observer failed");
-		}, { cwd: e.root });
-		assert.ok(updates > 0);
-		assert.equal(result.isError, false);
-		assert.equal(result.usage.input, 40);
-		assert.equal(result.usage.output, 20);
-		assert.equal(result.usage.cost.total, 3.75);
-		assert.deepEqual(result.usage, result.details.results[0].fullUsage);
-	});
-});
-
-test("consult_advisor cancellation forwards accrued usage and consumes the attempt", async () => {
-	await withExtension(undefined, async ({ e, ext }) => {
-		fs.writeFileSync(path.join(e.agentDir, "agents", "advisor.md"), AGENT("advisor"));
-		const tool = ext.tools.get("consult_advisor").definition;
-		const controller = new AbortController();
-		let input = 0;
-		const call = tool.execute("id", { task: "usage-early gate" }, controller.signal, (partial) => {
-			input = partial.details.results[0].fullUsage.input;
-		}, { cwd: e.root });
-		await until(() => input === 10);
-		controller.abort();
-		const result = await call;
-		assert.equal(result.isError, true);
-		assert.equal(result.details.results[0].status, "aborted");
-		assert.equal(result.usage.input, 10);
-		assert.equal(result.usage.cost.total, 0.9375);
-		assert.match(text(await tool.execute("again", { task: "retry" }, undefined, undefined, { cwd: e.root })), /escalate.*parent/i);
-		assert.deepEqual(promptTempDirs(e), []);
-	});
-});
-
-test("general subagent children get consultation only when explicitly allowlisted", async () => {
-	await withExtension(undefined, async ({ e, call }) => {
-		const ordinary = await call({ agent: "worker", task: "ordinary" });
-		assert.match(text(ordinary), /--tools read --append-system-prompt/);
-		assert.doesNotMatch(text(ordinary), /consult_advisor|--no-mcp/);
-		fs.writeFileSync(path.join(e.agentDir, "agents", "worker.md"), AGENT("worker").replace("tools: read", "tools: read,consult_advisor"));
-		const allowed = await call({ agent: "worker", task: "allowed" });
-		assert.match(text(allowed), /--tools read,consult_advisor/);
-		assert.doesNotMatch(text(allowed), /--no-mcp/);
-	});
-});
-
 test("loader registers the subagent tool and a session_shutdown handler", async () => {
 	await withExtension(undefined, async ({ ext, tool }) => {
 		assert.equal(tool.name, "subagent");
 		assert.equal(ext.handlers.get("session_shutdown")?.length, 1);
-		assert.match(tool.description, /maximum 32/);
+		assert.match(tool.description, /maximum 8/);
+		assert.equal(ext.tools.has("consult_advisor"), false);
 	});
 });
 
@@ -790,25 +654,122 @@ test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is 
 	});
 });
 
-test("advisor correctness guidance is registered for every consultation caller", async () => {
-	await withExtension(undefined, async ({ ext }) => {
-		const guidance = ext.tools.get("consult_advisor").definition.promptGuidelines.join("\n");
-		assert.match(guidance, /Passing supplied tests does not override the requirements/);
-		assert.match(guidance, /Investigate advisor-identified correctness risks/);
-		assert.match(guidance, /blocking gap/);
-	});
-});
-
-test("consult_advisor is inactive by default so the parent does not see it", async () => {
-	await withExtension(undefined, async ({ ext }) => {
-		assert.equal(ext.tools.get("consult_advisor").definition.defaultActive, false);
-	});
-});
-
-test("removed schema fields are not model-visible but old calls still validate", async () => {
+test("the schema offers only agent, task, tasks and cwd", async () => {
 	await withExtension(undefined, async ({ tool }) => {
-		for (const key of ["chain", "agentScope", "confirmProjectAgents"]) assert.equal(key in tool.parameters.properties, false);
-		assert.notEqual(tool.parameters.additionalProperties, false);
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["agent", "cwd", "task", "tasks"]);
+		assert.equal(tool.parameters.properties.tasks.maxItems, 8);
+	});
+});
+
+const writeRole = (e, name, tools, description = `test ${name}`) =>
+	fs.writeFileSync(path.join(e.agentDir, "agents", `${name}.md`), `---\nname: ${name}\ndescription: ${description}\ntools: ${tools}\n---\nYou are ${name}.\n`);
+
+test("children receive PI_SUBAGENT_DEPTH, one above the caller, and are detached only from depth 0", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		assert.match(text(await call({ agent: "worker", task: "showenv" })), /depth=1 groupLeader=true/);
+	});
+	await withExtension(undefined, async ({ call }) => {
+		assert.match(text(await call({ agent: "worker", task: "showenv" })), /depth=2 groupLeader=false/);
+	}, "1");
+});
+
+test("at depth 0 every role is listed and callable", async () => {
+	await withExtension(undefined, async ({ e, ext, call }) => {
+		writeRole(e, "editor", "read, edit, write, subagent");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /worker: test worker/);
+		assert.match(description, /editor: test editor/);
+		assert.equal(text(await call({ agent: "editor", task: "go" })).includes("task=go"), true);
+	});
+});
+
+test("at depth 1 only read-only roles are listed and callable, and editors are refused before any spawn", async () => {
+	await withExtension(undefined, async ({ e, call, events }) => {
+		writeRole(e, "advisor", "read, grep, bash");
+		writeRole(e, "editor", "read, edit");
+		writeRole(e, "writer", "read, write");
+		writeRole(e, "delegator", "read, subagent");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /advisor: test advisor/);
+		assert.match(description, /worker: test worker/);
+		assert.doesNotMatch(description, /editor:|writer:|delegator:/);
+		assert.match(description, /read-only roles only/);
+
+		for (const agent of ["editor", "writer", "delegator"]) {
+			const refused = await call({ agent, task: "go" });
+			assert.equal(refused.isError, true);
+			assert.match(text(refused), new RegExp(`read-only roles.*Refused: ${agent}`));
+		}
+		const mixed = await call({ tasks: [{ agent: "worker", task: "fine" }, { agent: "editor", task: "no" }] });
+		assert.equal(mixed.isError, true);
+		assert.equal(events().length, 0, "a refused batch spawns nothing");
+
+		const allowed = await call({ tasks: [{ agent: "advisor", task: "showenv" }, { agent: "worker", task: "showenv" }] });
+		assert.match(text(allowed), /2\/2 succeeded/);
+		assert.match(text(allowed), /depth=2/);
+	}, "1");
+});
+
+for (const depth of ["2", "5"]) {
+	test(`at depth ${depth} the tool refuses with a clear error and never spawns`, async () => {
+		await withExtension(undefined, async ({ call, events }) => {
+			for (const params of [{ agent: "worker", task: "x" }, { tasks: [P(1)] }]) {
+				const r = await call(params);
+				assert.equal(r.isError, true);
+				assert.match(text(r), /nesting is limited to one level/);
+			}
+			assert.equal(events().length, 0);
+		}, depth);
+	});
+}
+
+test("guidelines are parent-oriented at depth 0 and delegation-limited at depth 1", async () => {
+	await withExtension(undefined, async ({ tool }) => {
+		const guidance = tool.promptGuidelines.join("\n");
+		assert.ok(tool.promptGuidelines.length <= 6);
+		assert.match(guidance, /overlapping files/);
+		assert.match(guidance, /settle shared contracts/);
+		assert.match(guidance, /generated files, lockfiles/);
+		assert.match(guidance, /call the advisor once on the combined diff/);
+		assert.match(guidance, /Redirect noisy command output to a file/);
+		assert.match(guidance, /unverified/);
+		assert.doesNotMatch(guidance, /cannot delegate edits/);
+	});
+	await withExtension(undefined, async ({ tool }) => {
+		const guidance = tool.promptGuidelines.join("\n");
+		assert.match(guidance, /Ask the advisor once for a hard decision and the explorer for lookups\. You cannot delegate edits\./);
+		assert.doesNotMatch(guidance, /parallel call|combined diff before reporting done/);
+	}, "1");
+});
+
+test("skipped role files are named in the roster and never block valid roles", async () => {
+	await withExtension(undefined, async ({ e }) => {
+		fs.writeFileSync(path.join(e.agentDir, "agents", "explorer.md"), "---\nname: explorer\ndescription: Look: around\ntools: read\n---\nbody\n");
+		fs.writeFileSync(path.join(e.agentDir, "agents", "notools.md"), "---\nname: notools\ndescription: x\n---\nbody\n");
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		assert.deepEqual(loaded.errors, []);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.match(description, /worker: test worker/);
+		assert.match(description, /Skipped agent files: .*explorer\.md \(invalid frontmatter\)/);
+		assert.match(description, /notools\.md \(missing name, description or tools\)/);
+	});
+	await withExtension(undefined, async ({ tool }) => {
+		assert.doesNotMatch(tool.description, /Skipped/);
+	});
+});
+
+test("the shipped starter roles all load without being skipped", async () => {
+	await withExtension(undefined, async ({ e }) => {
+		const starters = path.join(here, "agents");
+		for (const file of fs.readdirSync(starters).filter((f) => f.endsWith(".md"))) {
+			fs.copyFileSync(path.join(starters, file), path.join(e.agentDir, "agents", file));
+		}
+		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
+		const description = loaded.extensions[0].tools.get("subagent").definition.description;
+		assert.doesNotMatch(description, /Skipped/);
+		for (const name of ["advisor", "explorer", "implementer"]) assert.match(description, new RegExp(`${name}: `));
 	});
 });
 
@@ -819,106 +780,32 @@ test("the tool description lists the available agents so no AGENTS.md roster is 
 	});
 });
 
-test("project scope, chain mode and oversized batches are rejected without spawning", async () => {
+test("oversized and ambiguous calls are rejected without spawning", async () => {
 	await withExtension(undefined, async ({ call, events }) => {
-		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "project" })), /Project-local subagents are disabled/);
-		assert.match(text(await call({ agent: "worker", task: "x", agentScope: "both" })), /disabled/);
-		assert.match(text(await call({ chain: [{ agent: "worker", task: "x" }] })), /Chain mode is disabled/);
-		const oversized = await call({ tasks: Array.from({ length: 33 }, (_, n) => P(n)) });
-		assert.match(text(oversized), /Too many parallel tasks \(33\)\. Max is 32/);
+		const oversized = await call({ tasks: Array.from({ length: 9 }, (_, n) => P(n)) });
+		assert.equal(oversized.isError, true);
+		assert.match(text(oversized), /Too many parallel tasks \(9\)\. Max is 8/);
+		assert.match(text(await call({ agent: "worker", task: "x", tasks: [P(1)] })), /Invalid parameters/);
+		assert.match(text(await call({})), /Invalid parameters/);
 		assert.equal(events().length, 0);
 	});
 });
 
-for (const bad of ["0", "17", "abc", "2.5"]) {
-	test(`invalid PI_SUBAGENT_MAX_CONCURRENCY=${bad} fails clearly and never spawns`, async () => {
-		await withExtension(bad, async ({ call, events }) => {
-			for (const params of [{ agent: "worker", task: "x" }, { tasks: [P(1), P(2)] }]) {
-				const r = await call(params);
-				assert.equal(r.isError, true);
-				assert.match(text(r), /PI_SUBAGENT_MAX_CONCURRENCY/);
-			}
-			assert.equal(events().length, 0);
-		});
-	});
-}
-
-for (const capacity of [6, 8, 16]) {
-	test(`a 32-task batch runs at configured capacity ${capacity}`, async () => {
-		await withExtension(capacity === 6 ? undefined : String(capacity), async ({ e, call, events }) => {
-			const pending = call({ tasks: Array.from({ length: 32 }, (_, n) => P(n, "gate")) });
-			await until(() => events().filter((ev) => ev.kind === "S").length === capacity);
-			assert.equal(maxOverlap(events()), capacity);
-			fs.writeFileSync(e.log + ".release", "go");
-			const result = await pending;
-			assert.equal(result.details.results.length, 32);
-			assert.ok(result.details.results.every((r) => r.status === "completed"));
-			assert.equal(maxOverlap(events()), capacity);
-		});
-	});
-}
-
-test("default capacity is 6 for a full parallel batch", async () => {
-	await withExtension(undefined, async ({ call, events }) => {
-		const r = await call({ tasks: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => P(n, "sleep:250")) });
-		assert.match(text(r), /8\/8 succeeded/);
-		assert.equal(maxOverlap(events()), 6);
-	});
-});
-
-for (const [requested, expected] of [[8, 8], [12, 8]]) {
-	test(`maxConcurrency ${requested} raises a parallel call to ${expected} and later calls return to 6`, async () => {
-		await withExtension(undefined, async ({ e, call, events }) => {
-			const pending = call({ maxConcurrency: requested, tasks: Array.from({ length: 16 }, (_, n) => P(n, "gate")) });
-			await until(() => events().filter((ev) => ev.kind === "S").length === expected);
-			assert.equal(maxOverlap(events()), expected);
+for (const [value, expected] of [[undefined, 4], ["2", 2], ["99", 16], ["0", 1], ["abc", 4]]) {
+	test(`PI_SUBAGENT_MAX_CONCURRENCY=${value} gives a limit of ${expected}`, async () => {
+		await withExtension(value, async ({ tool, e, call, events }) => {
+			assert.match(tool.description, new RegExp(`At most ${expected} subagent processes`));
+			const count = Math.min(expected, 8);
+			const pending = call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "gate")) });
+			await until(() => events().filter((ev) => ev.kind === "S").length === count);
+			await sleep(100);
+			assert.equal(maxOverlap(events()), count);
 			fs.writeFileSync(e.log + ".release", "go");
 			assert.ok((await pending).details.results.every((r) => r.status === "completed"));
-			assert.equal(maxOverlap(events()), expected);
-			const before = events().length;
-			await call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "sleep:150")) });
-			assert.equal(maxOverlap(events().slice(before)), 6);
+			assert.equal(maxOverlap(events()), count);
 		});
 	});
 }
-
-test("the result says when maxConcurrency was clamped or could not raise the limit", async () => {
-	await withExtension(undefined, async ({ call }) => {
-		const clamped = await call({ maxConcurrency: 12, tasks: [P(1), P(2)] });
-		assert.match(text(clamped), /maxConcurrency 12 was clamped to the ceiling of 8/);
-		const noop = await call({ maxConcurrency: 4, tasks: [P(1), P(2)] });
-		assert.match(text(noop), /maxConcurrency 4 did not raise the limit/);
-		const honored = await call({ maxConcurrency: 8, tasks: [P(1), P(2)] });
-		assert.doesNotMatch(text(honored), /Note: maxConcurrency/);
-	});
-});
-
-test("maxConcurrency is clamped to a configured ceiling and cannot lower the base", async () => {
-	await withExtension("2", async ({ call, events }) => {
-		await call({ maxConcurrency: 1, tasks: [1, 2, 3, 4].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 2);
-	}, "3");
-	await withExtension("2", async ({ call, events }) => {
-		await call({ maxConcurrency: 10, tasks: [1, 2, 3, 4, 5, 6].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 3);
-	}, "3");
-});
-
-test("a ceiling below the base disables spawning with a clear error", async () => {
-	await withExtension("6", async ({ call, events }) => {
-		const r = await call({ agent: "worker", task: "x" });
-		assert.equal(r.isError, true);
-		assert.match(text(r), /PI_SUBAGENT_CONCURRENCY_CEILING/);
-		assert.equal(events().length, 0);
-	}, "4");
-});
-
-test("configured capacity bounds a single batch", async () => {
-	await withExtension("2", async ({ call, events }) => {
-		await call({ tasks: [1, 2, 3, 4].map((n) => P(n, "sleep:150")) });
-		assert.equal(maxOverlap(events()), 2);
-	});
-});
 
 test("overlapping single and parallel calls share one limiter", async () => {
 	await withExtension("2", async ({ call, events }) => {
@@ -1106,7 +993,7 @@ test("stderr is bounded and omissions are counted in details", async () => {
 
 test("large child errors and failure reasons cannot bypass retained or batch budgets", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: [{ agent: 'worker', task: 'fail-large-error-large-reason' }, ...Array.from({ length: 31 }, (_, n) => P(n))] });
+		const r = await call({ tasks: [{ agent: 'worker', task: 'fail-large-error-large-reason' }, ...Array.from({ length: 7 }, (_, n) => P(n))] });
 		const failed = r.details.results[0];
 		assert.equal(failed.status, 'failed');
 		assert.ok(Buffer.byteLength(failed.errorMessage) <= 64 * 1024);
@@ -1117,7 +1004,7 @@ test("large child errors and failure reasons cannot bypass retained or batch bud
 
 test("short results return unused batch budget to longer results", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: [P(0, 'big'), ...Array.from({ length: 31 }, (_, n) => P(n + 1))] });
+		const r = await call({ tasks: [P(0, 'big'), ...Array.from({ length: 7 }, (_, n) => P(n + 1))] });
 		assert.match(text(r).split('\n\n---\n\n')[0], /x{15000}/);
 		assert.ok(Buffer.byteLength(text(r)) <= 128 * 1024);
 	});
@@ -1125,11 +1012,11 @@ test("short results return unused batch budget to longer results", async () => {
 
 test("a large batch has a fair bounded model-facing output budget", async () => {
 	await withExtension(undefined, async ({ call }) => {
-		const r = await call({ tasks: Array.from({ length: 32 }, (_, n) => P(n, "big")) });
+		const r = await call({ tasks: Array.from({ length: 8 }, (_, n) => P(n, "big")) });
 		assert.ok(Buffer.byteLength(text(r)) <= 128 * 1024);
-		assert.equal((text(r).match(/### \[worker\] completed/g) ?? []).length, 32);
-		assert.equal((text(r).match(/Output truncated/g) ?? []).length, 32);
-		assert.equal(r.details.results.length, 32);
+		assert.equal((text(r).match(/### \[worker\] completed/g) ?? []).length, 8);
+		assert.equal((text(r).match(/Output truncated/g) ?? []).length, 8);
+		assert.equal(r.details.results.length, 8);
 	});
 });
 
@@ -1156,13 +1043,13 @@ test("results without status (older stored calls) still render", async () => {
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const legacy = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, stderr: "", ...extra });
+		const legacy = (extra) => ({ agent: "worker", task: "t", usage, stderr: "", ...extra });
 		const render = (details) =>
 			tool
 				.renderResult({ content: [{ type: "text", text: "x" }], details }, { expanded: false }, theme, {})
 				.render(120)
 				.join("\n");
-		const base = { agentScope: "user", projectAgentsDir: null };
+		const base = {};
 		const out = render({
 			...base,
 			mode: "parallel",
@@ -1191,9 +1078,9 @@ test("results without status (older stored calls) still render", async () => {
 test("rendering uses the retained final answer after history eviction", async () => {
 	await withExtension(undefined, async ({ tool }) => {
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
-		const result = { agent: 'worker', agentSource: 'user', task: 'x', status: 'completed', exitCode: 0, messages: [], stderr: '', finalOutput: 'survived final answer', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
+		const result = { agent: 'worker', task: 'x', status: 'completed', exitCode: 0, messages: [], stderr: '', finalOutput: 'survived final answer', usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 } };
 		for (const mode of ['single', 'parallel']) for (const expanded of [false, true]) {
-			const rendered = tool.renderResult({ content: [{ type: 'text', text: 'x' }], details: { mode, agentScope: 'user', projectAgentsDir: null, results: [result] } }, { expanded }, theme, {}).render(120).join('\n');
+			const rendered = tool.renderResult({ content: [{ type: 'text', text: 'x' }], details: { mode, results: [result] } }, { expanded }, theme, {}).render(120).join('\n');
 			assert.match(rendered, /survived final answer/);
 		}
 	});
@@ -1204,8 +1091,8 @@ test("pending, aborted and failed states render explicit icons in both views", a
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const r = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, stderr: "", exitCode: -1, messages: [], ...extra });
-		const base = { agentScope: "user", projectAgentsDir: null };
+		const r = (extra) => ({ agent: "worker", task: "t", usage, stderr: "", exitCode: -1, messages: [], ...extra });
+		const base = {};
 		const render = (details, expanded) =>
 			tool.renderResult({ content: [{ type: "text", text: "x" }], details }, { expanded }, theme, {}).render(120).join("\n");
 		for (const expanded of [false, true]) {
@@ -1297,8 +1184,8 @@ test("legacy results without a retained final answer render all text parts in ex
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 };
 		const parts = (...ts) => [{ role: "assistant", content: ts.map((t) => ({ type: "text", text: t })) }];
-		const legacy = (messages) => ({ agent: "worker", agentSource: "user", task: "t", exitCode: 0, status: "completed", usage, stderr: "", messages });
-		const render = (mode, messages) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, agentScope: "user", projectAgentsDir: null, results: [legacy(messages)] } }, { expanded: true }, theme, {}).render(120).join("\n");
+		const legacy = (messages) => ({ agent: "worker", task: "t", exitCode: 0, status: "completed", usage, stderr: "", messages });
+		const render = (mode, messages) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, results: [legacy(messages)] } }, { expanded: true }, theme, {}).render(120).join("\n");
 		for (const mode of ["single", "parallel"]) {
 			assert.match(render(mode, parts("alpha", "beta")), /alphabeta/);
 			const big = render(mode, parts("a".repeat(40000), "é".repeat(20000)));
@@ -1402,8 +1289,8 @@ test("failed results show diagnostics in single and parallel, collapsed and expa
 		const theme = { fg: (_c, t) => t, bold: (t) => t };
 		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
 		const msg = (t) => [{ role: "assistant", content: [{ type: "text", text: t }] }];
-		const r = (extra) => ({ agent: "worker", agentSource: "user", task: "t", usage, exitCode: 3, status: "failed", messages: [], stderr: "", ...extra });
-		const render = (mode, result, expanded) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, agentScope: "user", projectAgentsDir: null, results: [result] } }, { expanded }, theme, {}).render(200).join("\n");
+		const r = (extra) => ({ agent: "worker", task: "t", usage, exitCode: 3, status: "failed", messages: [], stderr: "", ...extra });
+		const render = (mode, result, expanded) => tool.renderResult({ content: [{ type: "text", text: "x" }], details: { mode, results: [result] } }, { expanded }, theme, {}).render(200).join("\n");
 		for (const mode of ["single", "parallel"]) for (const expanded of [false, true]) {
 			const label = `${mode} expanded=${expanded}`;
 			const stderrOnly = render(mode, r({ stderr: "child crashed: EBADF" }), expanded);
@@ -1421,4 +1308,45 @@ test("failed results show diagnostics in single and parallel, collapsed and expa
 			assert.doesNotMatch(ok, /harmless warning/, label);
 		}
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Process-tree cancellation with real processes (no model calls)
+// ---------------------------------------------------------------------------
+import { spawn as realSpawn } from "node:child_process";
+
+test("cancelling a detached child that ignores SIGTERM removes its grandchild too", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-tree-"));
+	const pidFile = path.join(root, "pids");
+	const script = path.join(root, "child.mjs");
+	// Stands in for pi: ignores SIGTERM and starts a grandchild that also ignores it and holds the output pipes.
+	fs.writeFileSync(script, `
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+process.on("SIGTERM", () => {});
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "inherit" });
+fs.writeFileSync(process.argv[2], process.pid + " " + grandchild.pid);
+setInterval(() => {}, 1000);
+`);
+	const runner = createChildRunner({ capacity: 1, spawn: realSpawn, killGraceMs: 300 });
+	const controller = new AbortController();
+	const run = runner.run({
+		signal: controller.signal,
+		prepare: () => ({ command: process.execPath, args: [script, pidFile], cwd: root, detached: true }),
+	});
+	let pids = [];
+	try {
+		await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").split(" ").length === 2);
+		pids = fs.readFileSync(pidFile, "utf8").split(" ").map(Number);
+		await sleep(300); // let the grandchild install its SIGTERM handler
+		assert.ok(pids.every(pidAlive));
+		const started = Date.now();
+		controller.abort();
+		assert.equal((await run).status, "aborted");
+		assert.ok(Date.now() - started >= 250, "the TERM-ignoring tree survives until the grace period ends");
+		await until(() => pids.every((pid) => !pidAlive(pid)), 2000);
+	} finally {
+		for (const pid of pids) try { process.kill(pid, "SIGKILL"); } catch {}
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });

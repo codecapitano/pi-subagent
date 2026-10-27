@@ -4,9 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-
-export type AgentScope = "user" | "project" | "both";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export interface AgentConfig {
 	name: string;
@@ -14,13 +12,12 @@ export interface AgentConfig {
 	tools: string[];
 	model?: string;
 	systemPrompt: string;
-	source: "user" | "project";
-	filePath: string;
 }
 
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
-	projectAgentsDir: string | null;
+	/** Role files that were ignored, with the reason. */
+	skipped: { file: string; reason: string }[];
 }
 
 /**
@@ -56,118 +53,59 @@ function parseToolList(value: unknown): string[] | null {
 	return tools.length > 0 ? tools : null;
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
-	const agents: AgentConfig[] = [];
+/** A role that cannot edit files or delegate. Bash stays allowed; read-only use is a prompt rule. */
+export function isReadOnlyAgent(agent: AgentConfig): boolean {
+	return !agent.tools.some((tool) => tool === "edit" || tool === "write" || tool === "subagent");
+}
 
-	if (!fs.existsSync(dir)) {
-		return agents;
-	}
-
+/** Reads user-level roles from the agent directory. A malformed file is skipped and reported, never fatal. */
+export function discoverAgents(): AgentDiscoveryResult {
+	const dir = path.join(getAgentDir(), "agents");
+	const result: AgentDiscoveryResult = { agents: [], skipped: [] };
 	let entries: fs.Dirent[];
 	try {
 		entries = fs.readdirSync(dir, { withFileTypes: true });
 	} catch {
-		return agents;
+		return result;
 	}
 
 	for (const entry of entries) {
-		if (!entry.name.endsWith(".md")) continue;
-		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-
-		const filePath = path.join(dir, entry.name);
-		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
-		}
+		if (!entry.name.endsWith(".md") || !(entry.isFile() || entry.isSymbolicLink())) continue;
+		const skip = (reason: string) => result.skipped.push({ file: entry.name, reason });
 
 		let parsed: ReturnType<typeof parseFrontmatter<AgentFrontmatter>>;
 		try {
-			parsed = parseFrontmatter<AgentFrontmatter>(content);
+			parsed = parseFrontmatter<AgentFrontmatter>(fs.readFileSync(path.join(dir, entry.name), "utf-8"));
 		} catch {
-			continue; // A malformed definition is skipped; it never grants fallback tools or blocks other agents.
-		}
-		const { frontmatter, body } = parsed;
-
-		const tools = parseToolList(frontmatter.tools);
-		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string" || !tools) {
+			skip("invalid frontmatter");
 			continue;
 		}
-
-		agents.push({
+		const { frontmatter, body } = parsed;
+		const tools = parseToolList(frontmatter.tools);
+		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string" || !tools) {
+			skip("missing name, description or tools");
+			continue;
+		}
+		result.agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools,
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			systemPrompt: body,
-			source,
-			filePath,
 		});
 	}
-
-	return agents;
+	return result;
 }
 
-function isDirectory(p: string): boolean {
-	try {
-		return fs.statSync(p).isDirectory();
-	} catch {
-		return false;
-	}
-}
-
-function findNearestProjectAgentsDir(cwd: string): string | null {
-	let currentDir = cwd;
-	while (true) {
-		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
-		if (isDirectory(candidate)) return candidate;
-
-		const parentDir = path.dirname(currentDir);
-		if (parentDir === currentDir) return null;
-		currentDir = parentDir;
-	}
-}
-
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
-	const userDir = path.join(getAgentDir(), "agents");
-	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
-
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
-
-	const agentMap = new Map<string, AgentConfig>();
-
-	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
-	}
-
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
-}
-
-export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
-	if (agents.length === 0) return { text: "none", remaining: 0 };
-	const listed = agents.slice(0, maxItems);
-	const remaining = agents.length - listed.length;
-	return {
-		text: listed.map((a) => `${a.name} (${a.source}): ${a.description}`).join("; "),
-		remaining,
-	};
-}
-
-/** One line per agent for the tool description, bounded so a large directory cannot bloat the prompt. */
-export function describeAgents(agents: AgentConfig[], maxItems = 20, maxDescription = 120): string {
-	if (agents.length === 0) return "No user-level agents are defined yet.";
+/** Roster text for the tool description, bounded so a large directory cannot bloat the prompt. */
+export function describeAgents({ agents, skipped }: AgentDiscoveryResult, maxItems = 20, maxDescription = 120): string {
 	const clip = (text: string) => {
 		const oneLine = text.replace(/\s+/g, " ").trim().replace(/[.;]+$/, "");
 		return oneLine.length > maxDescription ? `${oneLine.slice(0, maxDescription - 3)}...` : oneLine;
 	};
 	const lines = agents.slice(0, maxItems).map((a) => `${a.name}: ${clip(a.description)}`);
 	const more = agents.length - lines.length;
-	return `Available agents: ${lines.join("; ")}${more > 0 ? `; and ${more} more` : ""}.`;
+	const roster = lines.length === 0 ? "No user-level agents are defined yet." : `Available agents: ${lines.join("; ")}${more > 0 ? `; and ${more} more` : ""}.`;
+	const warning = skipped.length === 0 ? "" : ` Skipped agent files: ${skipped.slice(0, 5).map((s) => `${s.file} (${s.reason})`).join(", ")}.`;
+	return roster + warning;
 }

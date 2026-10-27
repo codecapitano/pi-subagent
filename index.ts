@@ -4,12 +4,11 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Local policy supports two modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *
- * Chain and project-agent execution from the upstream example are retained only
- * for compatibility with stored calls and rejected before execution.
+ * Nesting is limited to depth 1: a child may delegate only to read-only roles,
+ * and a grandchild may not delegate at all (PI_SUBAGENT_DEPTH).
  *
  * Uses JSON mode to capture structured output from subagents.
  */
@@ -29,11 +28,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, describeAgents, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentDiscoveryResult, describeAgents, discoverAgents, isReadOnlyAgent } from "./agents.ts";
 import { createChildRunner, parseConcurrency } from "./lifecycle.mjs";
 import { createHistory, createLineReader, createStderrBuffer, createUsageTotals, joinTextParts, truncateUtf8, BATCH_OUTPUT_BYTES, FINAL_BYTES } from "./output.mjs";
 
-const MAX_PARALLEL_TASKS = 32;
+const MAX_PARALLEL_TASKS = 8;
+const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const COLLAPSED_ITEM_COUNT = 10;
 const MODEL_VISIBLE_OUTPUT_CAP = 16 * 1024;
 
@@ -108,27 +108,17 @@ function formatToolCall(
 			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
 			return text;
 		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
+		case "edit":
 		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
+			const rawPath = (args.file_path || args.path || (toolName === "ls" ? "." : "...")) as string;
+			return themeFg("muted", `${toolName} `) + themeFg("accent", shortenPath(rawPath));
 		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
+		case "find":
 		case "grep": {
-			const pattern = (args.pattern || "") as string;
+			const pattern = (args.pattern || (toolName === "find" ? "*" : "")) as string;
 			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
+			const shown = toolName === "grep" ? `/${pattern}/` : pattern;
+			return themeFg("muted", `${toolName} `) + themeFg("accent", shown) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
 		}
 		default: {
 			const argsStr = JSON.stringify(args);
@@ -152,7 +142,6 @@ type TaskStatus = "queued" | "running" | "completed" | "failed" | "aborted";
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
 	task: string;
 	/** Process exit code; -1 until a child has finished. Independent of `status`. */
 	exitCode: number;
@@ -172,9 +161,7 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
+	mode: "single" | "parallel";
 	results: SingleResult[];
 }
 
@@ -317,7 +304,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	consultation = false,
+	depth: number,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -326,7 +313,6 @@ async function runSingleAgent(
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		return {
 			agent: agentName,
-			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			status: "failed",
@@ -344,15 +330,13 @@ async function runSingleAgent(
 	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
 		args.push("--thinking", dispatchDefaults.thinkingLevel);
 	}
-	args.push("--tools", consultation ? "read,grep,find,ls" : agent.tools.join(","));
-	if (consultation) args.push("--no-mcp");
+	args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
-		agentSource: agent.source,
 		task,
 		exitCode: -1,
 		status: "queued",
@@ -443,7 +427,14 @@ async function runSingleAgent(
 			}
 			spawnArgs.push(`Task: ${task}`);
 			const invocation = getPiInvocation(spawnArgs);
-			return { command: invocation.command, args: invocation.args, cwd: cwd ?? defaultCwd };
+			// Only top-level children lead their own process group; nested ones stay in it, so one group kill reaches every descendant.
+			return {
+				command: invocation.command,
+				args: invocation.args,
+				cwd: cwd ?? defaultCwd,
+				detached: depth === 0,
+				env: { ...process.env, [DEPTH_ENV]: String(depth + 1) },
+			};
 		},
 		cleanup: () => {
 			if (tmpPromptPath)
@@ -504,109 +495,73 @@ const TaskItem = Type.Object({
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { maxItems: MAX_PARALLEL_TASKS, description: "Up to 32 independent tasks" })),
-	maxConcurrency: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			maximum: 16,
-			description: "Parallel mode only. Raise active subagents for this call, up to the configured ceiling. For independent read-only work only.",
-		}),
-	),
+	tasks: Type.Optional(Type.Array(TaskItem, { maxItems: MAX_PARALLEL_TASKS, description: `Up to ${MAX_PARALLEL_TASKS} independent tasks` })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
-export default function (pi: ExtensionAPI) {
-	// Validated once at load. An invalid setting disables spawning and is reported by the tool.
-	let limits = { base: 6, ceiling: 8 };
-	let configError: string | undefined;
-	try {
-		limits = parseConcurrency(process.env);
-	} catch (error) {
-		configError = error instanceof Error ? error.message : String(error);
+function parseDepth(raw: string | undefined): number {
+	return raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : 0;
+}
+
+function guidelinesFor(depth: number): string[] {
+	const brief = "Give each subagent a self-contained brief: goal, scope, constraints, owned files for edits, exact acceptance commands, and the exact result to return. It cannot see this conversation.";
+	const noisy = "Redirect noisy command output to a file and read only the summary. Treat results as unverified: inspect the combined diff and check the acceptance criteria yourself before reporting success.";
+	if (depth > 0) {
+		return [
+			"Ask the advisor once for a hard decision and the explorer for lookups. You cannot delegate edits.",
+			brief,
+			noisy,
+		];
 	}
+	return [
+		"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself. Pick the role whose description fits; do not run a fixed explore, plan, implement, review pipeline.",
+		brief,
+		"Run independent tasks in one parallel call. Never give parallel writers overlapping files; run overlapping edits one after another.",
+		"For multi-lane edits, settle shared contracts (API shape, types) first. You own generated files, lockfiles, and heavy or port-binding checks, and run them once on the combined state.",
+		"After two or more implementer lanes, call the advisor once on the combined diff before reporting done. Small tasks get no automatic review.",
+		noisy,
+	];
+}
+
+const textError = (text: string): AgentToolResult<SubagentDetails> & { isError: true } => ({
+	content: [{ type: "text", text }],
+	details: { mode: "single", results: [] },
+	isError: true,
+});
+
+export default function (pi: ExtensionAPI) {
+	const depth = parseDepth(process.env[DEPTH_ENV]);
 	// One runner per extension runtime: single and parallel calls share its FIFO limiter.
-	const runner: ChildRunner = createChildRunner({ capacity: limits.base, ceiling: limits.ceiling, spawn });
+	const limit = parseConcurrency(process.env);
+	const runner: ChildRunner = createChildRunner({ capacity: limit, spawn });
 
 	// Pi awaits this before tearing the runtime down (quit, reload, session replacement).
 	pi.on("session_shutdown", async () => {
 		await runner.shutdown();
 	});
 
+	// Nested callers see and may use read-only roles only.
+	const visible = (discovery: AgentDiscoveryResult): AgentDiscoveryResult =>
+		depth === 0 ? discovery : { ...discovery, agents: discovery.agents.filter(isReadOnlyAgent) };
+
 	// The model can only name agents it knows about. List them here so no AGENTS.md roster is
 	// needed. Read once at load; add or rename agents, then /reload.
-	let rosterText = "No user-level agents are defined yet.";
-	try {
-		rosterText = describeAgents(discoverAgents(process.cwd(), "user").agents);
-	} catch {
-		/* a broken agents directory must not prevent the tool from loading */
-	}
-
-	let consultationAttempted = false;
-	pi.registerTool({
-		name: "consult_advisor",
-		label: "Consult advisor",
-		description: "Consult the user-level advisor for a bounded read-only decision. It does not inherit your conversation; supply the objective, acceptance criteria, constraints, current changes, evidence, and proposed approach.",
-		promptSnippet: "Ask the advisor a focused decision question",
-		// Only workers that list it in their tools get it; the parent already reaches the advisor via subagent.
-		defaultActive: false,
-		promptGuidelines: [
-			"Consult once, after initial inspection, before a consequential approach with unresolved assumptions or compatibility risks, or when investigation stops converging. Skip routine work. Failures use the attempt; escalate further uncertainty to the parent.",
-			"The advisor recommends; you own the decision and verification. It cannot edit, run shell commands, or delegate.",
-			"Passing supplied tests does not override the requirements. Investigate advisor-identified correctness risks even when tests omit them. Resolve confirmed in-scope defects and add regression coverage when test edits are permitted. If a required fix or test is outside your ownership, or a material correctness risk remains unresolved, return it as a blocking gap; do not claim completion.",
-		],
-		parameters: Type.Object({
-			task: Type.String({ description: "Objective, acceptance criteria, constraints, current changes, file evidence and exact failures if any; decision needed, options, and proposed approach" }),
-			cwd: Type.Optional(Type.String({ description: "Working directory for the advisor process" })),
-		}, { additionalProperties: false }),
-		async execute(_toolCallId, params, signal, observer, ctx) {
-			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
-				mode: "single", agentScope: "user", projectAgentsDir: null, results,
-			});
-			if (consultationAttempted) return {
-				content: [{ type: "text", text: "Advisor consultation already attempted in this runtime. Escalate to the parent instead of retrying." }],
-				details: makeDetails([]), isError: true,
-			};
-			// Claim before discovery, preparation, or any await. Failures also consume the attempt.
-			consultationAttempted = true;
-			if (configError) return {
-				content: [{ type: "text", text: `Advisor consultation is disabled: ${configError}` }],
-				details: makeDetails([]), isError: true,
-			};
-			const onUpdate: OnUpdateCallback | undefined = observer ? (partial) => {
-				try { observer(partial); } catch { /* ignore observer failures */ }
-			} : undefined;
-			const result = await runSingleAgent(
-				runner, ctx.cwd,
-				{ model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined, thinkingLevel: ctx.thinkingLevel },
-				discoverAgents(ctx.cwd, "user").agents, "advisor", params.task, params.cwd,
-				signal, onUpdate, makeDetails, true,
-			);
-			return {
-				content: [{ type: "text", text: truncateModelVisibleOutput(getResultOutput(result)) }],
-				details: makeDetails([result]), usage: sumUsage([result]), isError: isFailedResult(result),
-			};
-		},
-	});
+	const rosterText = describeAgents(visible(discoverAgents()));
 
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate focused tasks to user-level subagents with isolated context.",
-			"Supported modes: single (agent + task) and parallel (tasks array, maximum 32).",
-			`At most ${limits.base} subagent processes run at once per Pi runtime (PI_SUBAGENT_MAX_CONCURRENCY, 1-16); extra tasks wait in FIFO order.`,
-			`In parallel mode, maxConcurrency may raise that to at most ${limits.ceiling} for the call; use it only for independent read-only work.`,
+			`Supported modes: single (agent + task) and parallel (tasks array, maximum ${MAX_PARALLEL_TASKS}).`,
+			`At most ${limit} subagent processes run at once per Pi runtime (PI_SUBAGENT_MAX_CONCURRENCY, 1-16); extra tasks wait in FIFO order.`,
+			depth > 0 ? "Nested use accepts read-only roles only." : "",
 			`Agents are loaded from ${path.join(getAgentDir(), "agents")}.`,
 			rosterText,
-		].join(" "),
+		].filter(Boolean).join(" "),
 		promptSnippet: "Delegate focused tasks to subagents with isolated context, singly or in parallel",
 		// Appended to the system prompt while the tool is active, so no AGENTS.md entry is needed.
-		promptGuidelines: [
-			"Use subagent for work that splits into independent parts, or whose output is much larger than its conclusion (broad searches, reviews, noisy checks). Do small or sequential work yourself. Pick the agent whose description fits; do not run a fixed explore, plan, implement, review pipeline.",
-			"Give each subagent a self-contained brief: goal, scope, constraints, owned files for edits, exact acceptance commands, and the exact result to return. It cannot see this conversation.",
-			"Run independent tasks in one parallel call. Never give parallel tasks overlapping writable files; run overlapping edits one after another.",
-			"Treat results as unverified. Before reporting success, inspect the combined diff and check the acceptance criteria yourself.",
-		],
+		promptGuidelines: guidelinesFor(depth),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, observer, ctx) {
@@ -614,93 +569,45 @@ export default function (pi: ExtensionAPI) {
 			const onUpdate = observer ? (partial: AgentToolResult<SubagentDetails>) => {
 				try { observer(partial); } catch { /* ignore observer failures */ }
 			} : undefined;
-			if (configError) {
-				return {
-					content: [{ type: "text", text: `Subagent is disabled: ${configError}` }],
-					details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [] },
-					isError: true,
-				};
-			}
-			// Removed from the schema; stored calls may still carry them and are rejected here.
-			const legacy = params as { agentScope?: AgentScope; chain?: unknown[] };
-			const requestedScope: AgentScope = legacy.agentScope ?? "user";
-			if (requestedScope !== "user") {
-				return {
-					content: [{ type: "text", text: "Project-local subagents are disabled." }],
-					details: { mode: "single", agentScope: requestedScope, projectAgentsDir: null, results: [] },
-				};
-			}
-			const agentScope: AgentScope = "user";
+			if (depth >= 2) return textError(`Subagent nesting is limited to one level (${DEPTH_ENV}=${depth}); do this work yourself.`);
+
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
 			};
-			const discovery = discoverAgents(ctx.cwd, agentScope);
-			const agents = discovery.agents;
+			const discovery = discoverAgents();
+			const agents = visible(discovery).agents;
+			const makeDetails = (mode: "single" | "parallel") => (results: SingleResult[]): SubagentDetails => ({ mode, results });
 
-			const hasChain = (legacy.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-				});
-
-			if (hasChain) {
-				return {
-					content: [{ type: "text", text: "Chain mode is disabled; return each result to the parent for review." }],
-					details: makeDetails("chain")([]),
-				};
+			if (hasTasks === hasSingle) {
+				const available = agents.map((a) => a.name).join(", ") || "none";
+				return textError(`Invalid parameters. Provide either agent and task, or tasks.\nAvailable agents: ${available}`);
+			}
+			if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
+				return textError(`Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`);
+			}
+			const requested = params.tasks ?? [{ agent: params.agent as string, task: params.task as string, cwd: params.cwd }];
+			const refused = depth === 1
+				? [...new Set(requested.map((t) => t.agent))].filter((name) => discovery.agents.some((a) => a.name === name && !isReadOnlyAgent(a)))
+				: [];
+			if (refused.length > 0) {
+				return textError(`Nested subagents may only use read-only roles (no edit, write or subagent tools). Refused: ${refused.join(", ")}.`);
 			}
 
-			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
+			if (params.tasks) {
 				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = no exit yet; see status
-						status: "queued",
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-						fullUsage: emptyUsage(),
-					};
-				}
+				const allResults: SingleResult[] = params.tasks.map((t) => ({
+					agent: t.agent,
+					task: t.task,
+					exitCode: -1, // -1 = no exit yet; see status
+					status: "queued" as const,
+					messages: [],
+					stderr: "",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+					fullUsage: emptyUsage(),
+				}));
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
@@ -708,46 +615,19 @@ export default function (pi: ExtensionAPI) {
 						const running = allResults.filter((r) => getStatus(r) === "running").length;
 						const done = allResults.length - queued - running;
 						onUpdate({
-							content: [
-								{
-									type: "text",
-									text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${queued} queued...`,
-								},
-							],
+							content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${queued} queued...` }],
 							details: makeDetails("parallel")([...allResults]),
 						});
 					}
 				};
 
 				// The shared limiter bounds active children; every task keeps its own result.
-				// A raise lasts only for this call so it cannot leak into later calls.
-				const lowerLimit = params.maxConcurrency ? runner.raise(params.maxConcurrency) : undefined;
-				// Say so when the request could not be honored, so the model does not assume more parallelism.
-				const requested = params.maxConcurrency;
-				const limitNote =
-					requested === undefined
-						? ""
-						: requested > limits.ceiling
-							? `Note: maxConcurrency ${requested} was clamped to the ceiling of ${limits.ceiling}.\n\n`
-							: requested <= limits.base
-								? `Note: maxConcurrency ${requested} did not raise the limit; it only raises above ${limits.base}.\n\n`
-								: "";
-				let results: SingleResult[];
-				try {
-				results = await Promise.all(
+				const results = await Promise.all(
 					params.tasks.map(async (t, index) => {
 						let result: SingleResult;
 						try {
 							result = await runSingleAgent(
-								runner,
-								ctx.cwd,
-								dispatchDefaults,
-								agents,
-								t.agent,
-								t.task,
-								t.cwd,
-								signal,
-								// Per-task update callback
+								runner, ctx.cwd, dispatchDefaults, agents, t.agent, t.task, t.cwd, signal,
 								(partial) => {
 									if (partial.details?.results[0]) {
 										allResults[index] = partial.details.results[0];
@@ -755,6 +635,7 @@ export default function (pi: ExtensionAPI) {
 									}
 								},
 								makeDetails("parallel"),
+								depth,
 							);
 						} catch (error) {
 							result = {
@@ -769,9 +650,6 @@ export default function (pi: ExtensionAPI) {
 						return result;
 					}),
 				);
-				} finally {
-					lowerLimit?.();
-				}
 
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const headers = results.map((r) => {
@@ -783,7 +661,7 @@ export default function (pi: ExtensionAPI) {
 								: "completed";
 					return `### [${truncateUtf8(r.agent, 128, "...")}] ${status}\n\n`;
 				});
-				const prefix = `${limitNote}Parallel: ${successCount}/${results.length} succeeded\n\n`;
+				const prefix = `Parallel: ${successCount}/${results.length} succeeded\n\n`;
 				const separator = "\n\n---\n\n";
 				const overhead = Buffer.byteLength(prefix + headers.join(separator));
 				const outputs = results.map(getResultOutput);
@@ -798,55 +676,26 @@ export default function (pi: ExtensionAPI) {
 				}
 				const summaries = results.map((_r, i) => headers[i] + truncateModelVisibleOutput(outputs[i], budgets[i]));
 				return {
-					content: [
-						{
-							type: "text",
-							text: prefix + summaries.join(separator),
-						},
-					],
+					content: [{ type: "text", text: prefix + summaries.join(separator) }],
 					details: makeDetails("parallel")(results),
 					usage: sumUsage(results),
 				};
 			}
 
-			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					runner,
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
-					return {
-						content: [
-							{ type: "text", text: truncateModelVisibleOutput(`Agent ${result.stopReason && !NORMAL_STOP_REASONS.has(result.stopReason) ? result.stopReason : `failed${getFailureReason(result) ? ` (${getFailureReason(result)})` : ""}`}: ${errorMsg}`) },
-						],
-						details: makeDetails("single")([result]),
-						usage: sumUsage([result]),
-						isError: true,
-					};
-				}
-				return {
-					content: [
-						{ type: "text", text: truncateModelVisibleOutput(getResultOutput(result)) },
-					],
-					details: makeDetails("single")([result]),
-					usage: sumUsage([result]),
-				};
-			}
-
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const result = await runSingleAgent(
+				runner, ctx.cwd, dispatchDefaults, agents, requested[0].agent, requested[0].task, requested[0].cwd, signal,
+				onUpdate, makeDetails("single"), depth,
+			);
+			const isError = isFailedResult(result);
+			const output = getResultOutput(result);
+			const failure = result.stopReason && !NORMAL_STOP_REASONS.has(result.stopReason)
+				? result.stopReason
+				: `failed${getFailureReason(result) ? ` (${getFailureReason(result)})` : ""}`;
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
+				content: [{ type: "text", text: truncateModelVisibleOutput(isError ? `Agent ${failure}: ${output}` : output) }],
+				details: makeDetails("single")([result]),
+				usage: sumUsage([result]),
+				...(isError ? { isError } : {}),
 			};
 		},
 
@@ -854,8 +703,7 @@ export default function (pi: ExtensionAPI) {
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", " [user]");
+					theme.fg("accent", `parallel (${args.tasks.length} tasks)`);
 				for (const t of args.tasks.slice(0, 3)) {
 					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
@@ -863,14 +711,9 @@ export default function (pi: ExtensionAPI) {
 				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
 			}
-			const agentName = args.agent || "...";
 			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				theme.fg("muted", " [user]");
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
+			const text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", args.agent || "...");
+			return new Text(`${text}\n  ${theme.fg("dim", preview)}`, 0, 0);
 		},
 
 		renderResult(result, { expanded }, theme, _context) {
@@ -921,7 +764,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (expanded) {
 					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}${stateLabel}`;
+					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${stateLabel}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (diagnostic) container.addChild(new Text(theme.fg("error", `Error: ${diagnostic}`), 0, 0));
@@ -956,7 +799,7 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}${stateLabel}`;
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${stateLabel}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (diagnostic) text += `\n${theme.fg("error", `Error: ${diagnostic}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", finalOutput ? truncateModelVisibleOutput(finalOutput) : placeholderFor(r))}`;

@@ -7,7 +7,7 @@ how to write the brief, parallel limits and checking results. Add to
 ```markdown
 ## Subagents
 
-- Run `reviewer` before declaring done on changes to auth, billing or migrations.
-- Use `verifier` for the full test suite; run single-command checks yourself.
-- Use `advisor` before any change to a public API.
+- Use `advisor` before any change to auth, billing, migrations or a public API.
+- Use `explorer` for any lookup that needs more than three files.
+- Run the full test suite yourself, with output redirected to a file.
 ```
