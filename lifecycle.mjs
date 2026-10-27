@@ -34,9 +34,6 @@ export const KILL_GRACE_MS = 5000;
  * child has closed (or was never started). Aborts never spawn queued work; running
  * children get SIGTERM, then SIGKILL after `killGraceMs`, and keep their slot until close.
  *
- * `prepare()` may also return `stdin: true` (pipe stdin instead of ignoring it) and `env` (merged over
- * the parent's environment). `onSpawn(proc)` then lets the caller write to the child.
- *
  * `run()` never rejects. Its result is `{ status, exitCode, signal, error, spawned }`
  * where status is "completed" | "failed" | "aborted".
  */
@@ -115,7 +112,7 @@ export function createChildRunner({
 	};
 
 	async function execute(spec) {
-		const { signal, prepare, cleanup, onState, onStdout, onStderr, onSpawn } = spec;
+		const { signal, prepare, cleanup, onState, onStdout, onStderr } = spec;
 		const emit = (state) => {
 			try {
 				onState?.(state);
@@ -168,20 +165,12 @@ export function createChildRunner({
 				proc = spawn(command.command, command.args, {
 					cwd: command.cwd,
 					shell: false,
-					stdio: [command.stdin ? "pipe" : "ignore", "pipe", "pipe"],
-					...(command.env ? { env: { ...process.env, ...command.env } } : {}),
+					stdio: ["ignore", "pipe", "pipe"],
 				});
 			} catch (error) {
 				return failed(error);
 			}
-			// A child that exits early closes its stdin; the resulting EPIPE must not crash the parent.
-			proc.stdin?.on("error", () => {});
 			emit("running");
-			try {
-				onSpawn?.(proc);
-			} catch {
-				/* observers must not break scheduling */
-			}
 
 			return await new Promise((resolve) => {
 				let settled = false;

@@ -31,7 +31,6 @@
     "agents.ts",
     "lifecycle.mjs",
     "output.mjs",
-    "worktree.mjs",
     "agents",
     "README.md",
     "LICENSE"
