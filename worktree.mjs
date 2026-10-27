@@ -71,7 +71,7 @@ const serialized = (fn) => {
 	return run;
 };
 
-/** Same slug rule as `branchSlug` in pi-worktree (extensions/git-worktree.ts). */
+/** Turns a branch name into a safe directory name: unsafe characters become `-`, lower case. */
 export function branchSlug(branch) {
 	return branch
 		.replace(/^refs\/heads\//, "")
@@ -86,9 +86,8 @@ function isDirectory(dir) {
 }
 
 /**
- * Lane directory layout copied from `resolveWorktreePath` in pi-worktree
- * (extensions/git-worktree.ts): `<parent>/worktrees/<repo>/<slug>` when the workspace has a
- * `worktrees` directory, else `<parent>/<repo>-<slug>`.
+ * Lane directory layout: `<parent>/worktrees/<repo>/<slug>` when the directory containing the
+ * repository also has a `worktrees` directory, else the sibling `<parent>/<repo>-<slug>`.
  */
 export function resolveLanePath(main, branch) {
 	const repo = path.basename(main);

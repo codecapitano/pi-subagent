@@ -49,7 +49,7 @@ test("a lane is a new branch and worktree at HEAD in the sibling layout", async 
 	});
 });
 
-test("a workspace worktrees directory selects the nested layout, like pi-worktree", async () => {
+test("a workspace worktrees directory selects the nested layout", async () => {
 	await withRepo(async ({ root, repo }) => {
 		fs.mkdirSync(path.join(root, "worktrees"));
 		const lane = await createLane({ cwd: repo, agent: "worker", id: "abc123" });
