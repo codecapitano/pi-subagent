@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const destination = path.resolve(process.argv[2] ?? path.join(os.homedir(), ".pi/agent/extensions/subagent"));
 const backupRoot = path.resolve(process.env.PI_SUBAGENT_BACKUP_DIR ?? path.join(os.homedir(), ".pi/agent/backups"));
-const files = ["index.ts", "agents.ts", "lifecycle.mjs", "output.mjs", "subagent.test.mjs", "output.test.mjs", "README.md", "LICENSE"];
+const files = ["index.ts", "agents.ts", "lifecycle.mjs", "output.mjs", "worktree.mjs", "subagent.test.mjs", "output.test.mjs", "worktree.test.mjs", "README.md", "LICENSE"];
 
 function statIfPresent(file) {
 	try { return fs.lstatSync(file); }
