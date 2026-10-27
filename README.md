@@ -60,7 +60,7 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.4.0
+pi install git:github.com/codecapitano/pi-subagent@v0.6.0
 ```
 
 The tag pins the version. Update by installing a newer tag. This loads `index.ts`
