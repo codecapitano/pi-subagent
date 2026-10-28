@@ -102,6 +102,58 @@ test("run spawns prepared command with cwd and reports completed after close", a
 	assert.deepEqual(w.runner.stats(), { active: 0, queued: 0 });
 });
 
+test("task timeout terminates the child and holds its slot until close", async () => {
+	const w = world(1);
+	const first = w.runner.run(spec("a", { timeoutMs: 100 }));
+	const second = w.runner.run(spec("b"));
+	await tick();
+	assert.equal(w.timers.length, 1);
+	assert.equal(w.timers[0].ms, 100);
+	w.timers[0].fn();
+	assert.deepEqual(w.procs[0].kills, ["SIGTERM"]);
+	assert.deepEqual(w.runner.stats(), { active: 1, queued: 1 });
+	assert.equal(w.timers[1].ms, 5000);
+	w.timers[1].fn();
+	assert.deepEqual(w.procs[0].kills, ["SIGTERM", "SIGKILL"]);
+	w.procs[0].exit(null, "SIGKILL");
+	const result = await first;
+	assert.equal(result.status, "failed");
+	assert.equal(result.timedOut, true);
+	assert.match(result.error, /timed out after 100 ms/);
+	await tick();
+	w.procs[1].exit(0);
+	assert.equal((await second).status, "completed");
+});
+
+test("queued tasks get their full timeout only after spawning", async () => {
+	const w = world(1);
+	const first = w.runner.run(spec("a"));
+	const second = w.runner.run(spec("b", { timeoutMs: 100 }));
+	await tick();
+	assert.equal(w.timers.length, 0);
+	w.procs[0].exit(0);
+	await first;
+	await tick();
+	assert.equal(w.timers.length, 1);
+	assert.equal(w.timers[0].ms, 100);
+	w.procs[1].exit(0);
+	assert.equal((await second).status, "completed");
+	assert.equal(w.timers[0].cleared, true);
+});
+
+test("cancellation remains aborted even if the deadline fires during termination", async () => {
+	const w = world();
+	const controller = new AbortController();
+	const pending = w.runner.run(spec("a", { timeoutMs: 100, signal: controller.signal }));
+	await tick();
+	controller.abort();
+	w.timers[0].fn();
+	w.procs[0].exit(0);
+	assert.equal((await pending).status, "aborted");
+	assert.ok(w.timers[1].cleared);
+	assert.deepEqual(w.procs[0].kills, ["SIGTERM"]);
+});
+
 test("non-zero exit is failed and keeps the exit code", async () => {
 	const w = world();
 	const p = w.runner.run(spec("a"));
@@ -520,6 +572,7 @@ let done = false;
 const finish = (code) => {
 	if (done) return;
 	done = true;
+	if (/noanswer/.test(task)) { note("E"); process.exit(code); }
 	const text = /huge/.test(task) ? "answer " + "é".repeat(1024 * 1024) : /big/.test(task) ? "x".repeat(40000) : "cwd=" + process.cwd() + " task=" + task + " args=" + process.argv.slice(2, -1).join(" ") + (/showenv/.test(task) ? " depth=" + process.env.PI_SUBAGENT_DEPTH + " groupLeader=" + (Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)])) === process.pid) : "");
 	if (/noisy/.test(task)) for (let i = 0; i < 100; i++) process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "n".repeat(20000) }], usage: { input: 1, output: 1 }, stopReason: "stop" } }) + "\\n");
 	if (/usage(?!-early)/.test(task)) {
@@ -528,7 +581,11 @@ const finish = (code) => {
 		emit({ type: "message_end", message: toolResult });
 		emit({ type: "tool_result_end", message: toolResult });
 	}
-	const sendFinal = () => process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: /multipart/.test(task) ? [{ type: "text", text: "alpha" }, { type: "toolCall", id: "c", name: "read", arguments: {} }, { type: "text", text: "é-beta" }] : /multibig/.test(task) ? [{ type: "text", text: "a".repeat(40000) }, { type: "text", text: "é".repeat(20000) }] : /emptytext/.test(task) ? [{ type: "text", text: "" }] : [{ type: "text", text }], usage: /usage/.test(task) ? U(2) : { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 }, model: "fake", stopReason: /large-reason/.test(task) ? "r".repeat(2 * 1024 * 1024) : "stop", errorMessage: /large-error/.test(task) ? "error " + "e".repeat(2 * 1024 * 1024) : undefined } }) + "\\n", () => { note("E"); process.exit(code); });
+	if (/emptyterminal/.test(task)) {
+		emit(assistantUsage(U(1)));
+		emit({ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "file contents" }] } });
+	}
+	const sendFinal = () => process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: /emptyterminal/.test(task) ? [] : /multipart/.test(task) ? [{ type: "text", text: "alpha" }, { type: "toolCall", id: "c", name: "read", arguments: {} }, { type: "text", text: "é-beta" }] : /multibig/.test(task) ? [{ type: "text", text: "a".repeat(40000) }, { type: "text", text: "é".repeat(20000) }] : /whitespace/.test(task) ? [{ type: "text", text: /long-whitespace/.test(task) ? " ".repeat(70 * 1024) : "   " }] : /emptytext/.test(task) ? [{ type: "text", text: "" }] : [{ type: "text", text }], usage: /usage/.test(task) ? U(2) : { input: 1, output: 1, cost: { total: 0 }, totalTokens: 2 }, model: "fake", stopReason: /large-reason/.test(task) ? "r".repeat(2 * 1024 * 1024) : "stop", errorMessage: /large-error/.test(task) ? "error " + "e".repeat(2 * 1024 * 1024) : undefined } }) + "\\n", () => { note("E"); process.exit(code); });
 	if (/oversized/.test(task)) process.stdout.write("x".repeat(9 * 1024 * 1024) + (/complete/.test(task) ? "\\n" : ""), sendFinal);
 	else if (/stderr/.test(task)) process.stderr.write("z".repeat(200000) + "TAIL", sendFinal);
 	else sendFinal();
@@ -637,6 +694,47 @@ const pidAlive = (pid) => {
 };
 const P = (n, extra = "") => ({ agent: "worker", task: `t${n} ${extra}` });
 
+test("single task timeout reports a distinct failure without retrying", async () => {
+	await withExtension(undefined, async ({ call, events, e }) => {
+		const result = await call({ agent: "worker", task: "gate", timeoutMs: 300 }, AbortSignal.timeout(2000));
+		assert.equal(result.isError, true);
+		assert.equal(result.details.results[0].status, "failed");
+		assert.equal(result.details.results[0].stopReason, "timeout");
+		assert.match(text(result), /timed out after 300 ms/);
+		assert.ok(events().filter((event) => event.kind === "S").length <= 1);
+		assert.deepEqual(promptTempDirs(e), []);
+	});
+});
+
+test("a timed-out parallel task does not discard successful siblings", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		const result = await call({ tasks: [
+			{ agent: "worker", task: "gate", timeoutMs: 300 },
+			{ agent: "worker", task: "quick" },
+		] }, AbortSignal.timeout(2000));
+		assert.match(text(result), /1\/2 succeeded/);
+		assert.deepEqual(result.details.results.map((r) => r.status), ["failed", "completed"]);
+		assert.equal(result.details.results[0].stopReason, "timeout");
+		assert.match(text(result), /task=quick/);
+	});
+});
+
+test("invalid timeouts are refused before any child starts", async () => {
+	await withExtension(undefined, async ({ call, events }) => {
+		for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 2_147_483_648, null, "100"]) {
+			for (const params of [
+				{ agent: "worker", task: "quick", timeoutMs },
+				{ tasks: [{ agent: "worker", task: "quick", timeoutMs }] },
+			]) {
+				const result = await call(params);
+				assert.equal(result.isError, true);
+				assert.match(text(result), /timeoutMs must be an integer/);
+			}
+		}
+		assert.equal(events().length, 0);
+	});
+});
+
 test("loader registers the subagent tool and a session_shutdown handler", async () => {
 	await withExtension(undefined, async ({ ext, tool }) => {
 		assert.equal(tool.name, "subagent");
@@ -654,10 +752,16 @@ test("the tool carries its own system-prompt guidance, so no AGENTS.md entry is 
 	});
 });
 
-test("the schema offers only agent, task, tasks and cwd", async () => {
+test("the schema offers optional per-task timeouts in both modes", async () => {
 	await withExtension(undefined, async ({ tool }) => {
-		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["agent", "cwd", "task", "tasks"]);
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["agent", "cwd", "task", "tasks", "timeoutMs"]);
 		assert.equal(tool.parameters.properties.tasks.maxItems, 8);
+		for (const schema of [tool.parameters, tool.parameters.properties.tasks.items]) {
+			assert.equal(schema.properties.timeoutMs.type, "integer");
+			assert.equal(schema.properties.timeoutMs.minimum, 1);
+			assert.equal(schema.properties.timeoutMs.maximum, 2_147_483_647);
+			assert.ok(!schema.required?.includes("timeoutMs"));
+		}
 	});
 });
 
@@ -1171,11 +1275,76 @@ test("combined text parts over the cap are truncated once with a UTF-8-safe noti
 	});
 });
 
-test("an explicitly empty final text part yields no output rather than an earlier part", async () => {
+test("an explicitly empty final answer fails instead of reporting success", async () => {
 	await withExtension(undefined, async ({ call }) => {
 		const r = await call({ agent: "worker", task: "emptytext" });
 		assert.equal(r.details.results[0].finalOutput, "");
-		assert.equal(text(r), "(no output)");
+		assert.equal(r.isError, true);
+		assert.equal(r.details.results[0].status, "failed");
+		assert.equal(r.details.results[0].stopReason, "empty_output");
+		assert.match(text(r), /no final answer/);
+	});
+});
+
+test("a successful child with no assistant messages reports an empty-result failure", async () => {
+	await withExtension(undefined, async ({ call, events }) => {
+		const result = await call({ agent: "worker", task: "noanswer" });
+		assert.equal(result.isError, true);
+		assert.equal(result.details.results[0].stopReason, "empty_output");
+		assert.match(text(result), /no final answer/);
+		assert.equal(events().filter((event) => event.kind === "S").length, 1);
+	});
+});
+
+test("empty terminal messages fail despite earlier assistant narration", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		const single = await call({ agent: "worker", task: "emptyterminal" });
+		assert.equal(single.isError, true);
+		assert.equal(single.details.results[0].status, "failed");
+		assert.equal(single.details.results[0].stopReason, "empty_output");
+		assert.equal(single.details.results[0].finalOutput, "step");
+		assert.match(text(single), /no final answer/);
+
+		const parallel = await call({ tasks: [
+			{ agent: "worker", task: "emptyterminal" },
+			{ agent: "worker", task: "quick" },
+		] });
+		assert.match(text(parallel), /1\/2 succeeded/);
+		assert.deepEqual(parallel.details.results.map((r) => r.status), ["failed", "completed"]);
+		assert.equal(parallel.details.results[0].stopReason, "empty_output");
+	});
+});
+
+test("truncated whitespace-only answers fail in single and parallel mode", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		const single = await call({ agent: "worker", task: "long-whitespace" });
+		assert.equal(single.isError, true);
+		assert.equal(single.details.results[0].status, "failed");
+		assert.equal(single.details.results[0].stopReason, "empty_output");
+		assert.equal(single.details.results[0].output.finalOutputTruncated, true);
+		assert.match(single.details.results[0].finalOutput, /Output truncated/);
+		assert.match(text(single), /no final answer/);
+
+		const parallel = await call({ tasks: [
+			{ agent: "worker", task: "long-whitespace" },
+			{ agent: "worker", task: "quick" },
+		] });
+		assert.match(text(parallel), /1\/2 succeeded/);
+		assert.deepEqual(parallel.details.results.map((r) => r.status), ["failed", "completed"]);
+		assert.equal(parallel.details.results[0].stopReason, "empty_output");
+	});
+});
+
+test("whitespace-only answers do not count as parallel successes", async () => {
+	await withExtension(undefined, async ({ call }) => {
+		const result = await call({ tasks: [
+			{ agent: "worker", task: "whitespace" },
+			{ agent: "worker", task: "quick" },
+		] });
+		assert.match(text(result), /1\/2 succeeded/);
+		assert.deepEqual(result.details.results.map((r) => r.status), ["failed", "completed"]);
+		assert.equal(result.details.results[0].stopReason, "empty_output");
+		assert.match(text(result), /no final answer/);
 	});
 });
 

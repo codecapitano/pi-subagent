@@ -305,6 +305,7 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	depth: number,
+	timeoutMs?: number,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -416,6 +417,7 @@ async function runSingleAgent(
 	const lines = createLineReader(processLine);
 	const outcome = await runner.run({
 		signal,
+		timeoutMs,
 		// Runs after a child slot is acquired, so queued tasks create no temp files.
 		prepare: async () => {
 			const spawnArgs = [...args];
@@ -476,20 +478,35 @@ async function runSingleAgent(
 		currentResult.errorMessage ||= "Subagent was aborted";
 	} else if (outcome.status === "failed") {
 		currentResult.status = "failed";
+		if (outcome.timedOut) {
+			currentResult.stopReason = "timeout";
+			currentResult.errorMessage = outcome.error;
+		}
 	} else if (currentResult.stopReason === "aborted") {
 		currentResult.status = "aborted";
 	} else if (currentResult.stopReason === "error") {
 		currentResult.status = "failed";
+	} else if (!history.hasFinalOutput) {
+		currentResult.status = "failed";
+		currentResult.stopReason = "empty_output";
+		currentResult.errorMessage = "Subagent produced no final answer. Check any edits or command side effects before retrying.";
 	} else {
 		currentResult.status = "completed";
 	}
 	return currentResult;
 }
 
+const TimeoutMs = Type.Optional(Type.Integer({
+	minimum: 1,
+	maximum: 2_147_483_647,
+	description: "Execution timeout in milliseconds, excluding queue time. Omit for no timeout. No automatic retries.",
+}));
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	timeoutMs: TimeoutMs,
 });
 
 const SubagentParams = Type.Object({
@@ -497,6 +514,7 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { maxItems: MAX_PARALLEL_TASKS, description: `Up to ${MAX_PARALLEL_TASKS} independent tasks` })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	timeoutMs: TimeoutMs,
 });
 
 function parseDepth(raw: string | undefined): number {
@@ -588,7 +606,11 @@ export default function (pi: ExtensionAPI) {
 			if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
 				return textError(`Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`);
 			}
-			const requested = params.tasks ?? [{ agent: params.agent as string, task: params.task as string, cwd: params.cwd }];
+			const requested = params.tasks ?? [{ agent: params.agent as string, task: params.task as string, cwd: params.cwd, timeoutMs: params.timeoutMs }];
+			if (requested.some((task) => task.timeoutMs !== undefined &&
+				(!Number.isInteger(task.timeoutMs) || task.timeoutMs < 1 || task.timeoutMs > 2_147_483_647))) {
+				return textError("timeoutMs must be an integer between 1 and 2147483647 milliseconds.");
+			}
 			const refused = depth === 1
 				? [...new Set(requested.map((t) => t.agent))].filter((name) => discovery.agents.some((a) => a.name === name && !isReadOnlyAgent(a)))
 				: [];
@@ -636,6 +658,7 @@ export default function (pi: ExtensionAPI) {
 								},
 								makeDetails("parallel"),
 								depth,
+								t.timeoutMs,
 							);
 						} catch (error) {
 							result = {
@@ -684,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 
 			const result = await runSingleAgent(
 				runner, ctx.cwd, dispatchDefaults, agents, requested[0].agent, requested[0].task, requested[0].cwd, signal,
-				onUpdate, makeDetails("single"), depth,
+				onUpdate, makeDetails("single"), depth, requested[0].timeoutMs,
 			);
 			const isError = isFailedResult(result);
 			const output = getResultOutput(result);

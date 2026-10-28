@@ -60,11 +60,14 @@ export function createHistory(maxBytes = HISTORY_BYTES) {
 	let omittedMessages = 0;
 	let shortenedMessages = 0;
 	let finalOutput;
+	let hasFinalOutput = false;
 	let finalOutputTruncated = false;
 	return {
 		messages,
 		append(message) {
 			const text = message.role === "assistant" ? joinTextParts(message.content) : undefined;
+			// Use the latest assistant message, not earlier narration or diagnostic notices.
+			if (message.role === "assistant") hasFinalOutput = typeof text === "string" && /\S/.test(text);
 			if (typeof text === "string") {
 				finalOutputTruncated = Buffer.byteLength(text) > FINAL_BYTES;
 				finalOutput = truncateUtf8(text, FINAL_BYTES,
@@ -89,6 +92,7 @@ export function createHistory(maxBytes = HISTORY_BYTES) {
 			messages.push(stored); sizes.push(bytes); retainedBytes += bytes;
 		},
 		get finalOutput() { return finalOutput; },
+		get hasFinalOutput() { return hasFinalOutput; },
 		get stats() { return { retainedBytes, omittedMessages, shortenedMessages, finalOutputTruncated }; },
 	};
 }

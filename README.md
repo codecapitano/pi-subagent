@@ -24,12 +24,14 @@ agent can call. They are not a sandbox.
 
 One tool, `subagent`:
 
-- Single: `{ agent, task, cwd? }`
-- Parallel: `{ tasks: [{ agent, task, cwd? }, ...] }`, at most 8 tasks.
+- Single: `{ agent, task, cwd?, timeoutMs? }`
+- Parallel: `{ tasks: [{ agent, task, cwd?, timeoutMs? }, ...] }`, at most 8 tasks.
 
 Every task has its own result, status and optional working directory. Results keep
 input order, and one failed task does not lose the others. Model-facing output is
-bounded (see [Output limits](#output-limits)).
+bounded (see [Output limits](#output-limits)). Empty or whitespace-only answers are
+reported as failures, even when the child exits successfully. Check any edits or
+command side effects before retrying a failed task.
 
 A shared FIFO limiter keeps active helpers bounded across all calls in one Pi
 runtime. The default is 4. Set `PI_SUBAGENT_MAX_CONCURRENCY` before starting Pi to
@@ -60,7 +62,7 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.6.0
+pi install git:github.com/codecapitano/pi-subagent@v0.7.0
 ```
 
 The tag pins the version. Update by installing a newer tag. This loads `index.ts`
@@ -160,9 +162,16 @@ children are not detached and stay in their parent's group. If the group is alre
 gone, the signal falls back to the child's pid. Slots stay occupied until the child
 closes.
 
+Set `timeoutMs` on a single task or on each task in a parallel batch to limit its
+execution time. It must be an integer from 1 through 2147483647 milliseconds.
+The timer starts after spawning, so queue time is excluded. A timeout uses the
+same termination and five-second kill grace as cancellation, keeps partial output
+in the task details, and reports a failed task with stop reason `timeout`. Tasks
+are never retried automatically.
+
 Pi awaits the shutdown handler on reload, session replacement and quit. It aborts
-queued work and waits for active children to stop. There is no automatic task
-timeout. A hung child holds a slot until cancelled. A descendant that left the
+queued work and waits for active children to stop. Timeouts are off by default.
+Without one, a hung child holds a slot until cancelled. A descendant that left the
 process group can still outlive the cancel.
 
 ## Verification
@@ -172,8 +181,9 @@ npm test
 ```
 
 The tests cover the limiter, depth rules, role filtering, cancellation (including a
-process-tree test with real processes), output bounds, rendering, the installer, and
-Pi extension loading with fake child processes. They make no model calls. They need
+process-tree test with real processes), task timeouts, empty answers, output bounds,
+rendering, the installer, and Pi extension loading with fake child processes. They
+make no model calls. They need
 a Pi installation: they read it from `~/.pi/agent/install`, or from `PI_CORE_DIR`
 (the `@earendil-works/pi-coding-agent` package directory). Developed against Pi 1.2
 and 1.3.

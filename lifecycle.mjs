@@ -18,6 +18,8 @@ export const KILL_GRACE_MS = 5000;
  * children get SIGTERM, then SIGKILL after `killGraceMs`, and keep their slot until close.
  * A prepared command with `detached: true` leads its own process group and the signals go
  * to the whole group, so grandchildren cannot outlive a cancelled child.
+ * Optional `timeoutMs` starts after spawn and uses the same termination path.
+ * Timeouts return "failed" with `timedOut: true`; cancellation returns "aborted".
  *
  * `run()` never rejects. Its result is `{ status, exitCode, signal, error, spawned }`
  * where status is "completed" | "failed" | "aborted".
@@ -93,7 +95,7 @@ export function createChildRunner({
 	};
 
 	async function execute(spec) {
-		const { signal, prepare, cleanup, onState, onStdout, onStderr } = spec;
+		const { signal, prepare, cleanup, onState, onStdout, onStderr, timeoutMs } = spec;
 		const emit = (state) => {
 			try {
 				onState?.(state);
@@ -159,6 +161,8 @@ export function createChildRunner({
 				let settled = false;
 				let terminating = false;
 				let timer = null;
+				let timeoutTimer = null;
+				let timedOut = false;
 				let spawnError;
 
 				const detached = command.detached === true;
@@ -192,8 +196,11 @@ export function createChildRunner({
 					settled = true;
 					if (timer !== null) clearTimer(timer);
 					timer = null;
+					if (timeoutTimer !== null) clearTimer(timeoutTimer);
+					timeoutTimer = null;
 					const base = { exitCode: code ?? 1, signal: sig ?? null, spawned: true };
 					if (abortRequested) resolve({ ...base, status: "aborted" });
+					else if (timedOut) resolve({ ...base, status: "failed", timedOut: true, error: `Subagent timed out after ${timeoutMs} ms` });
 					else if (spawnError || sig || code !== 0) {
 						resolve({ ...base, status: "failed", error: spawnError ? spawnError.message : undefined });
 					} else resolve({ ...base, status: "completed" });
@@ -223,6 +230,15 @@ export function createChildRunner({
 				});
 				entry.abortHook = terminate;
 				if (abortRequested) terminate();
+				// Queue time is excluded. Termination keeps the slot until close, just like cancellation.
+				if (timeoutMs !== undefined && !terminating && !settled) {
+					timeoutTimer = setTimer(() => {
+						timeoutTimer = null;
+						if (terminating || settled) return;
+						timedOut = true;
+						terminate();
+					}, timeoutMs);
+				}
 			});
 		} finally {
 			stopListening();
