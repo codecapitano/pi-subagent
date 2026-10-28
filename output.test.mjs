@@ -76,6 +76,36 @@ test("an explicitly empty latest assistant text replaces the earlier final outpu
 	assert.equal(history.finalOutput, '');
 });
 
+test("answer presence uses original text rather than truncation notices", () => {
+	const history = createHistory();
+	assert.equal(history.hasFinalOutput, false);
+	history.append({ role: 'assistant', content: [{ type: 'text', text: 'earlier answer' }] });
+	assert.equal(history.hasFinalOutput, true);
+	history.append({ role: 'assistant', content: [{ type: 'text', text: ' \t\n'.repeat(FINAL_BYTES) }] });
+	assert.match(history.finalOutput, /Output truncated/);
+	assert.equal(history.hasFinalOutput, false);
+
+	history.append({ role: 'assistant', content: [{ type: 'text', text: ' '.repeat(FINAL_BYTES) }, { type: 'text', text: 'answer' }] });
+	assert.equal(history.hasFinalOutput, true, 'non-whitespace beyond the preview still counts');
+
+	history.append({ role: 'assistant', content: [{ type: 'text', text: '' }] });
+	assert.equal(history.hasFinalOutput, false);
+});
+
+test("a textless assistant message clears answer presence but preserves its preview", () => {
+	const history = createHistory();
+	history.append({ role: 'assistant', content: [{ type: 'text', text: 'earlier narration' }] });
+	history.append({ role: 'toolResult', content: [{ type: 'text', text: 'tool result' }] });
+	assert.equal(history.hasFinalOutput, true, 'tool results do not change assistant answer presence');
+	history.append({ role: 'assistant', content: [] });
+	assert.equal(history.hasFinalOutput, false);
+	assert.equal(history.finalOutput, 'earlier narration');
+	history.append({ role: 'toolResult', content: [{ type: 'text', text: 'another result' }] });
+	assert.equal(history.hasFinalOutput, false);
+	history.append({ role: 'assistant', content: [{ type: 'text', text: 'actual answer' }] });
+	assert.equal(history.hasFinalOutput, true);
+});
+
 test("combined text parts above the final cap get one UTF-8-safe notice", () => {
 	const history = createHistory();
 	history.append({ role: 'assistant', content: [{ type: 'text', text: 'é'.repeat(FINAL_BYTES / 2 - 10) }, { type: 'text', text: '😀'.repeat(100) }] });
