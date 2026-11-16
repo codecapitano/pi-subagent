@@ -11,7 +11,7 @@ const agentFiles = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
 test("starter agents are present", () => {
 	assert.deepEqual(
 		agentFiles.sort(),
-		["advisor.md", "explorer.md", "implementer.md"],
+		["advisor.md", "explorer.md", "implementer.md", "reviewer.md"],
 	);
 });
 
@@ -30,13 +30,22 @@ for (const file of agentFiles) {
 	});
 }
 
-test("implementer delegates read-only and advisor can run read-only bash", () => {
+test("implementer delegates read-only and advisory roles have read-only tools", () => {
 	const implementer = fs.readFileSync(path.join(agentsDir, "implementer.md"), "utf8");
 	assert.match(implementer, /^tools: \[read, edit, write, bash, grep, find, ls, subagent\]$/m);
 	const advisor = fs.readFileSync(path.join(agentsDir, "advisor.md"), "utf8");
 	assert.match(advisor, /^tools: \[read, grep, find, ls, bash\]$/m);
+	const reviewer = fs.readFileSync(path.join(agentsDir, "reviewer.md"), "utf8");
+	assert.match(reviewer, /^tools: \[read, grep, find, ls, bash\]$/m);
+	assert.match(reviewer, /Do not run tests, builds or installs/);
 	const explorer = fs.readFileSync(path.join(agentsDir, "explorer.md"), "utf8");
 	assert.match(explorer, /^tools: \[read, grep, find, ls, web_search, web_fetch\]$/m);
+});
+
+test("advisor focuses on decisions rather than diff reviews", () => {
+	const advisor = fs.readFileSync(path.join(agentsDir, "advisor.md"), "utf8");
+	assert.match(advisor, /hard decision/);
+	assert.doesNotMatch(advisor, /review of a diff|review shard/);
 });
 
 // Everything published must be free of machine-specific or private details.
@@ -70,7 +79,7 @@ test("no published file contains machine-specific or private details", () => {
 test("optional agents are valid and do not pin a model", () => {
 	const dir = path.join(agentsDir, "optional");
 	const files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-	assert.deepEqual(files, ["design-reviewer.md", "reviewer.md", "scout.md", "verifier.md"]);
+	assert.deepEqual(files, ["design-reviewer.md", "scout.md", "verifier.md"]);
 	for (const file of files) {
 		const match = /^---\n([\s\S]*?)\n---\n([\s\S]+)$/.exec(fs.readFileSync(path.join(dir, file), "utf8"));
 		assert.ok(match, `${file} frontmatter`);
