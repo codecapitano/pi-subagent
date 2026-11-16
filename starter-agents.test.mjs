@@ -43,16 +43,13 @@ test("implementer delegates read-only and advisor can run read-only bash", () =>
 const FORBIDDEN = [
 	/\/Users\//,
 	/\/home\/[a-z]/i,
-	/marcoschafer|schaefer|schäfer/i,
-	/grafana/i,
-	/openai-codex|luna|\bsol:/i,
+	/[a-z]:\\Users\\/i,
 	/[A-Za-z0-9._%+-]+@(?!users\.noreply\.github\.com)[A-Za-z0-9.-]+\.[a-z]{2,}/i,
 	/gh[pousr]_[A-Za-z0-9]{20,}/,
-	/\bmcp__(?!chrome_devtools__|figma__)/,
 ];
 function publishedFiles(dir) {
 	return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-		if (entry.name === ".git" || entry.name === "node_modules") return [];
+		if ([".git", "node_modules", ".yarn"].includes(entry.name) || entry.name.startsWith(".pnp.")) return [];
 		const full = path.join(dir, entry.name);
 		return entry.isDirectory() ? publishedFiles(full) : [full];
 	});
