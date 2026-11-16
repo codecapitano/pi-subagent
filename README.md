@@ -51,8 +51,8 @@ unset means 0).
   anything starts.
 - **Depth 2 or more**: the tool refuses with an error.
 
-So a child can ask the advisor or the explorer, but cannot start editors or deeper
-nesting. The depth is read when the extension loads.
+So a child can ask the advisor, explorer or reviewer, but cannot start editors or
+deeper nesting. The depth is read when the extension loads.
 
 ## Install
 
@@ -62,7 +62,7 @@ extension twice can register the tool twice.
 ### Pi package (recommended)
 
 ```sh
-pi install git:github.com/codecapitano/pi-subagent@v0.7.0
+pi install git:github.com/codecapitano/pi-subagent@v0.8.0
 ```
 
 The tag pins the version. Update by installing a newer tag. This loads `index.ts`
@@ -86,29 +86,31 @@ symlinks, stages the files, and backs up replaced files under
 
 ### Check the install
 
-Run `/reload` while Pi is idle, or restart Pi. The loaded extension does not change
-when files on disk change. Then check that the `subagent` tool is listed and that its
-description names your roles.
+Run `/reload` while Pi is idle, or restart the Pi process. If your UI does not expose
+`/reload`, restart its underlying Pi agent process. The loaded extension does not
+change when files on disk change. Then check that the `subagent` tool is listed and
+that its description names your roles.
 
 ## Roles
 
 Roles are Markdown files in `~/.pi/agent/agents/`. Every role needs `name`,
 `description` and a non-empty `tools` list. Quote a description that contains a
 colon. Only user-level roles are read. The roster is built when the extension
-loads, so run `/reload` after changing roles.
+loads, so reload or restart Pi after changing roles.
 
 If a role file is skipped (invalid frontmatter, or a missing name, description or
 tools), the tool description ends with a line such as
 `Skipped agent files: explorer.md (invalid frontmatter).` Nothing throws, and the
 other roles keep working.
 
-[`agents/`](agents/) ships three starters:
+[`agents/`](agents/) ships four starters:
 
 | Role | Tools | Use |
 | --- | --- | --- |
 | `explorer` | read, grep, find, ls, web_search, web_fetch | Local search and external documentation lookups |
 | `implementer` | read, edit, write, bash, grep, find, ls, subagent | A scoped change with its own checks. May ask the advisor once for a hard decision and the explorer for lookups. Cannot delegate edits |
-| `advisor` | read, grep, find, ls, bash | Hard decisions, and review shards on large diffs. Runs only read-only commands |
+| `advisor` | read, grep, find, ls, bash | Hard decisions and trade-offs. Runs only read-only commands |
+| `reviewer` | read, grep, find, ls, bash | Adversarial review of existing work, including combined diffs. Does not edit or run checks |
 
 `web_search` and `web_fetch` come from a separate Pi search package, not from this
 extension. Without one installed, the explorer is local-only.
@@ -119,11 +121,27 @@ Copy the starters without overwriting your own files:
 mkdir -p ~/.pi/agent/agents && cp -n agents/*.md ~/.pi/agent/agents/
 ```
 
-More roles (`reviewer`, `scout`, `verifier`, `design-reviewer`) are in
+More roles (`scout`, `verifier`, `design-reviewer`) are in
 [`agents/optional/`](agents/optional/).
 
 The starters do not pin a model, so each helper uses the parent's model. To route a
 role to another model, add `model: <provider>/<model>[:thinking]` to its frontmatter.
+For a cross-model review, configure your installed reviewer with a different model
+family from the one that wrote the change. This is a personal setting, not a starter
+default.
+
+### Upgrading to 0.8.0
+
+Package updates do not replace your installed roles. The reviewer starter moved
+from `agents/optional/reviewer.md` to `agents/reviewer.md`.
+
+- If you do not have an installed reviewer, copy `agents/reviewer.md` into
+  `~/.pi/agent/agents/`. The combined-diff guidance now expects this role.
+- In your installed advisor, remove the diff-review description and the paragraph
+  beginning "When used as a review shard". The advisor now focuses on decisions.
+- Preserve model settings and other customizations in existing role files. There
+  are no new provider or model defaults.
+- Reload or restart Pi as described in [Check the install](#check-the-install).
 
 ## Prompt guidance
 
@@ -132,7 +150,9 @@ The tool lists your roles in its own description and registers its own
 guidelines cover when to delegate, the brief, parallel work without overlapping
 files, multi-lane edits, review, and verifying results. They depend on depth: a
 child is told to ask the advisor once for a hard decision and the explorer for
-lookups, and that it cannot delegate edits. For personal policy, see
+lookups, and that it cannot delegate edits. After two or more implementer lanes, the
+parent is told to call the reviewer on the combined diff. Small tasks get no automatic
+review. For personal policy, see
 [`docs/agents-md-snippet.md`](docs/agents-md-snippet.md).
 
 ## Output limits

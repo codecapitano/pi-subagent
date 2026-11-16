@@ -536,7 +536,7 @@ function guidelinesFor(depth: number): string[] {
 		brief,
 		"Run independent tasks in one parallel call. Never give parallel writers overlapping files; run overlapping edits one after another.",
 		"For multi-lane edits, settle shared contracts (API shape, types) first. You own generated files, lockfiles, and heavy or port-binding checks, and run them once on the combined state.",
-		"After two or more implementer lanes, call the advisor once on the combined diff before reporting done. Small tasks get no automatic review.",
+		"After two or more implementer lanes, call the reviewer once on the combined diff before reporting done. Small tasks get no automatic review.",
 		noisy,
 	];
 }
