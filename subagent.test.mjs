@@ -836,7 +836,8 @@ test("guidelines are parent-oriented at depth 0 and delegation-limited at depth 
 		assert.match(guidance, /overlapping files/);
 		assert.match(guidance, /settle shared contracts/);
 		assert.match(guidance, /generated files, lockfiles/);
-		assert.match(guidance, /call the advisor once on the combined diff/);
+		assert.match(guidance, /call the reviewer once on the combined diff/);
+		assert.doesNotMatch(guidance, /advisor.*combined diff/);
 		assert.match(guidance, /Redirect noisy command output to a file/);
 		assert.match(guidance, /unverified/);
 		assert.doesNotMatch(guidance, /cannot delegate edits/);
@@ -873,7 +874,26 @@ test("the shipped starter roles all load without being skipped", async () => {
 		const loaded = await loadExtensions([path.join(here, "index.ts")], e.root);
 		const description = loaded.extensions[0].tools.get("subagent").definition.description;
 		assert.doesNotMatch(description, /Skipped/);
-		for (const name of ["advisor", "explorer", "implementer"]) assert.match(description, new RegExp(`${name}: `));
+		for (const name of ["advisor", "explorer", "implementer", "reviewer"]) assert.match(description, new RegExp(`${name}: `));
+		assert.match(description, /reviewer: Read-only adversarial review/);
+	});
+});
+
+test("a configured reviewer keeps its model and reasoning instead of the parent's", async () => {
+	await withExtension(undefined, async ({ e, tool }) => {
+		const reviewer = fs.readFileSync(path.join(here, "agents", "reviewer.md"), "utf8");
+		fs.writeFileSync(
+			path.join(e.agentDir, "agents", "reviewer.md"),
+			reviewer.replace("name: reviewer\n", "name: reviewer\nmodel: review-provider/review-model:high\n"),
+		);
+		const result = await tool.execute("id", { agent: "reviewer", task: "review" }, undefined, undefined, {
+			cwd: e.root,
+			model: { provider: "parent-provider", id: "parent-model" },
+			thinkingLevel: "low",
+		});
+		assert.match(text(result), /--model review-provider\/review-model:high/);
+		assert.match(text(result), /--tools read,grep,find,ls,bash/);
+		assert.doesNotMatch(text(result), /--thinking|parent-model/);
 	});
 });
 
